@@ -2,6 +2,9 @@
 
 Local desktop app (Tkinter) for browsing generated images and reading generation metadata.
 
+<img width="3839" height="2044" alt="image" src="https://github.com/user-attachments/assets/1d786320-9745-4ec4-9572-446558b30597" />
+
+
 ## Highlights
 - Multi-folder scan (recursive)
 - Fast thumbnail catalog with adjustable:
