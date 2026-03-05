@@ -1,4 +1,4 @@
-# PromptLense
+# PromptLens
 
 Local desktop app (Tkinter) for browsing generated images and reading generation metadata.
 
