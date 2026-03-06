@@ -4,6 +4,9 @@ Local desktop app (Tkinter) for browsing generated images and reading generation
 
 <img width="3839" height="2044" alt="image" src="https://github.com/user-attachments/assets/1d786320-9745-4ec4-9572-446558b30597" />
 
+## Useful
+
+You need to place the .exe file in a new folder. When you exit the application, a file with your settings is created or updated (if one already exists)—including selected folders, columns, and thumbnail sizes.
 
 ## Highlights
 - Multi-folder scan (recursive)
