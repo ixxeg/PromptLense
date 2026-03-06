@@ -136,6 +136,12 @@ class PreviewWindow(tk.Toplevel):
         self.max_zoom = 8.0
         self.base_image: Image.Image | None = None
         self.tk_image: ImageTk.PhotoImage | None = None
+        self._image_item: int | None = None
+        self._last_render_key: tuple[int, int, int] | None = None
+        self._pending_zoom: float | None = None
+        self._wheel_delta_accum = 0
+        self._wheel_flush_after_id: str | None = None
+        self._quality_after_id: str | None = None
 
         self._build_ui()
         self._load_image()
@@ -170,8 +176,11 @@ class PreviewWindow(tk.Toplevel):
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
         self.h_scroll.grid(row=1, column=0, sticky="ew")
+        self._image_item = self.canvas.create_image(0, 0, anchor="nw")
 
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+        self.canvas.bind("<Button-4>", self._on_mouse_wheel)
+        self.canvas.bind("<Button-5>", self._on_mouse_wheel)
         self.canvas.bind("<ButtonPress-1>", lambda e: self.canvas.scan_mark(e.x, e.y))
         self.canvas.bind("<B1-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
         self.bind("<plus>", lambda _e: self.zoom_in())
@@ -184,24 +193,38 @@ class PreviewWindow(tk.Toplevel):
         try:
             with Image.open(self.image_path) as im:
                 self.base_image = ImageOps.exif_transpose(im).convert("RGB")
-            # Defer initial fit until the toplevel and canvas have their final size.
-            self.after(30, self.fit_to_window)
-            self.after(140, self.fit_to_window)
+            # Defer one initial fit until the toplevel and canvas have a stable size.
+            self.after_idle(self._fit_once_ready)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Preview error", f"Cannot open image:\n{exc}")
             self.destroy()
 
-    def _render(self) -> None:
+    def _fit_once_ready(self) -> None:
+        if self.base_image is None:
+            return
+        self.update_idletasks()
+        if self.canvas.winfo_width() <= 2 or self.canvas.winfo_height() <= 2:
+            self.after(30, self._fit_once_ready)
+            return
+        self.fit_to_window()
+
+    def _render(self, resample: int = Image.Resampling.LANCZOS) -> None:
         if self.base_image is None:
             return
         w = max(1, int(self.base_image.width * self.zoom))
         h = max(1, int(self.base_image.height * self.zoom))
-        resized = self.base_image.resize((w, h), Image.Resampling.LANCZOS)
+        render_key = (w, h, int(resample))
+        if self._last_render_key == render_key and self.tk_image is not None:
+            self.zoom_var.set(f"{int(self.zoom * 100)}%")
+            return
+        resized = self.base_image.resize((w, h), resample)
         self.tk_image = ImageTk.PhotoImage(resized)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, image=self.tk_image, anchor="nw")
+        if self._image_item is None:
+            self._image_item = self.canvas.create_image(0, 0, anchor="nw")
+        self.canvas.itemconfigure(self._image_item, image=self.tk_image)
         self.canvas.configure(scrollregion=(0, 0, w, h))
         self.zoom_var.set(f"{int(self.zoom * 100)}%")
+        self._last_render_key = render_key
 
     def zoom_in(self) -> None:
         self.set_zoom(self.zoom * 1.15)
@@ -225,15 +248,82 @@ class PreviewWindow(tk.Toplevel):
         self.canvas.yview_moveto(0)
 
     def set_zoom(self, value: float) -> None:
-        self.zoom = max(self.min_zoom, min(self.max_zoom, value))
-        self._render()
+        self._set_zoom(value, interactive=False)
+
+    def _set_zoom(self, value: float, interactive: bool) -> None:
+        clamped = max(self.min_zoom, min(self.max_zoom, value))
+        self._pending_zoom = clamped
+        if abs(clamped - self.zoom) < 1e-9:
+            if self.tk_image is None:
+                self._render(Image.Resampling.LANCZOS)
+                return
+            if interactive:
+                self._schedule_quality_render()
+            return
+        self.zoom = clamped
+        if interactive:
+            self._render(Image.Resampling.BILINEAR)
+            self._schedule_quality_render()
+        else:
+            self._cancel_quality_render()
+            self._render(Image.Resampling.LANCZOS)
+
+    def _schedule_quality_render(self) -> None:
+        if self._quality_after_id is not None:
+            self.after_cancel(self._quality_after_id)
+        self._quality_after_id = self.after(130, self._render_quality)
+
+    def _cancel_quality_render(self) -> None:
+        if self._quality_after_id is not None:
+            self.after_cancel(self._quality_after_id)
+            self._quality_after_id = None
+
+    def _render_quality(self) -> None:
+        self._quality_after_id = None
+        self._render(Image.Resampling.LANCZOS)
+
+    @staticmethod
+    def _wheel_step(event: tk.Event) -> int:
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta:
+            return delta
+        num = int(getattr(event, "num", 0) or 0)
+        if num == 4:
+            return 120
+        if num == 5:
+            return -120
+        return 0
+
+    def _flush_wheel_zoom(self) -> None:
+        self._wheel_flush_after_id = None
+        delta = self._wheel_delta_accum
+        self._wheel_delta_accum = 0
+        if delta == 0:
+            return
+        ticks = int(delta / 120)
+        if ticks == 0:
+            ticks = 1 if delta > 0 else -1
+        base = self._pending_zoom if self._pending_zoom is not None else self.zoom
+        factor = 1.12 ** abs(ticks)
+        target = base * factor if ticks > 0 else base / factor
+        self._pending_zoom = target
+        self._set_zoom(target, interactive=True)
+
+    def destroy(self) -> None:
+        if self._wheel_flush_after_id is not None:
+            try:
+                self.after_cancel(self._wheel_flush_after_id)
+            except Exception:
+                pass
+            self._wheel_flush_after_id = None
+        self._cancel_quality_render()
+        super().destroy()
 
     def _on_mouse_wheel(self, event: tk.Event) -> None:
-        # Mouse wheel always zooms in preview mode.
-        if event.delta > 0:
-            self.zoom_in()
-        else:
-            self.zoom_out()
+        # Mouse wheel always zooms in preview mode (coalesced for smoother interaction).
+        self._wheel_delta_accum += self._wheel_step(event)
+        if self._wheel_flush_after_id is None:
+            self._wheel_flush_after_id = self.after(24, self._flush_wheel_zoom)
 
 
 class ImageMetadataViewer(tk.Tk):
@@ -255,11 +345,13 @@ class ImageMetadataViewer(tk.Tk):
         self.metadata_cache_sig: dict[str, tuple[int, int, int]] = {}
         self.search_index_cache: dict[str, tuple[tuple[int, int, int, str], str, str]] = {}
         self.image_state: dict[str, dict[str, object]] = {}
+        self.file_mtime_cache: dict[str, float] = {}
         self._cache_lock = threading.Lock()
         self.current_image_path: Path | None = None
         self.folders_panel_visible = True
         self.image_root_map: dict[str, Path] = {}
         self._scan_roots_snapshot: list[Path] = []
+        self._scan_token = 0
         self._update_check_in_progress = False
 
         self.thumb_size_var = tk.DoubleVar(value=float(DEFAULT_THUMB_SIZE))
@@ -602,18 +694,27 @@ class ImageMetadataViewer(tk.Tk):
         ).start()
 
     def _download_update_worker(self, asset_url: str, asset_name: str) -> None:
+        app_dir = get_app_dir()
+        safe_name = Path(asset_name).name
+        download_path = app_dir / f".update_{safe_name}.download"
         try:
-            app_dir = get_app_dir()
-            safe_name = Path(asset_name).name
-            download_path = app_dir / f".update_{safe_name}.download"
             req = urlrequest.Request(
                 asset_url,
                 headers={"User-Agent": f"PromptLens/{APP_VERSION}"},
             )
             with urlrequest.urlopen(req, timeout=60) as resp, open(download_path, "wb") as out:
-                out.write(resp.read())
+                while True:
+                    chunk = resp.read(512 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
             self.after(0, lambda: self._apply_downloaded_update(download_path))
         except Exception as exc:  # noqa: BLE001
+            try:
+                if download_path.exists():
+                    download_path.unlink()
+            except Exception:
+                pass
             self.after(0, lambda: self._on_update_check_finished(f"Download failed: {exc}", "error"))
 
     def _apply_downloaded_update(self, downloaded_file: Path) -> None:
@@ -1027,6 +1128,7 @@ class ImageMetadataViewer(tk.Tk):
             )
 
     def clear_folders(self) -> None:
+        self._scan_token += 1
         self.selected_dirs.clear()
         self._refresh_folder_rows()
         self._set_status("Folder list cleared", "info")
@@ -1036,6 +1138,7 @@ class ImageMetadataViewer(tk.Tk):
         self.all_image_paths = []
         self.image_paths = []
         self.image_root_map = {}
+        self.file_mtime_cache = {}
         self._render_thumbnails([])
 
     def _remove_folder(self, path: Path) -> None:
@@ -1048,10 +1151,12 @@ class ImageMetadataViewer(tk.Tk):
         if self.selected_dirs:
             self.scan_images()
         else:
+            self._scan_token += 1
             self._cancel_metadata_warmup()
             self.all_image_paths = []
             self.image_paths = []
             self.image_root_map = {}
+            self.file_mtime_cache = {}
             self._render_thumbnails([])
 
     def _refresh_folder_rows(self) -> None:
@@ -1369,7 +1474,7 @@ class ImageMetadataViewer(tk.Tk):
             filtered.append(path)
 
         reverse = sort_mode != "Oldest"
-        filtered.sort(key=self._safe_mtime, reverse=reverse)
+        filtered.sort(key=self._sort_mtime_cached, reverse=reverse)
         self._render_thumbnails(filtered)
 
     def scan_images(self) -> None:
@@ -1378,22 +1483,34 @@ class ImageMetadataViewer(tk.Tk):
             return
 
         self._cancel_metadata_warmup()
+        self._scan_token += 1
+        token = self._scan_token
         self._scan_roots_snapshot = list(self.selected_dirs)
         self._set_status("Scanning...", "busy")
-        threading.Thread(target=self._scan_worker, daemon=True).start()
+        threading.Thread(target=self._scan_worker, args=(token,), daemon=True).start()
 
-    def _scan_worker(self) -> None:
+    def _scan_worker(self, token: int) -> None:
         try:
             roots = list(self._scan_roots_snapshot or self.selected_dirs)
             found_by_key: dict[str, Path] = {}
             root_by_key: dict[str, Path] = {}
+            mtime_by_key: dict[str, float] = {}
             for root in roots:
+                if token != self._scan_token:
+                    return
                 for file_path in root.rglob("*"):
+                    if token != self._scan_token:
+                        return
                     try:
                         if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                             continue
                     except Exception:
                         continue
+                    mtime: float | None = None
+                    try:
+                        mtime = float(file_path.stat().st_mtime)
+                    except Exception:
+                        pass
                     try:
                         canonical = file_path.resolve()
                     except Exception:
@@ -1401,16 +1518,32 @@ class ImageMetadataViewer(tk.Tk):
                     key = str(canonical)
                     if key not in found_by_key:
                         found_by_key[key] = canonical
+                        if mtime is not None:
+                            mtime_by_key[key] = mtime
+                    elif mtime is not None and mtime > mtime_by_key.get(key, 0.0):
+                        mtime_by_key[key] = mtime
                     prev_root = root_by_key.get(key)
                     if prev_root is None or len(root.parts) > len(prev_root.parts):
                         root_by_key[key] = root
-            found = list(found_by_key.values())
-            found.sort(key=self._safe_mtime, reverse=True)
-            self.after(0, lambda: self._on_scan_complete(found, root_by_key))
+            found_keys = sorted(found_by_key.keys(), key=lambda k: mtime_by_key.get(k, 0.0), reverse=True)
+            found = [found_by_key[key] for key in found_keys]
+            if token != self._scan_token:
+                return
+            self.after(0, lambda: self._on_scan_complete(token, found, root_by_key, mtime_by_key))
         except Exception as exc:  # noqa: BLE001
+            if token != self._scan_token:
+                return
             self.after(0, lambda: self._set_status(f"Scan error: {exc}", "error"))
 
-    def _on_scan_complete(self, found: list[Path], root_by_key: dict[str, Path]) -> None:
+    def _on_scan_complete(
+        self,
+        token: int,
+        found: list[Path],
+        root_by_key: dict[str, Path],
+        mtime_by_key: dict[str, float],
+    ) -> None:
+        if token != self._scan_token:
+            return
         self.all_image_paths = found
         self.image_root_map = {}
         for path in found:
@@ -1419,6 +1552,7 @@ class ImageMetadataViewer(tk.Tk):
                 self.image_root_map[str(path)] = root
         # Keep cache entries only for existing files.
         existing = {str(p) for p in found}
+        self.file_mtime_cache = {key: float(value) for key, value in mtime_by_key.items() if key in existing}
         with self._cache_lock:
             self.metadata_cache = {k: v for k, v in self.metadata_cache.items() if k in existing}
             self.metadata_cache_sig = {k: v for k, v in self.metadata_cache_sig.items() if k in existing}
@@ -1848,6 +1982,8 @@ class ImageMetadataViewer(tk.Tk):
         return result
 
     def on_thumbnail_click(self, index: int) -> None:
+        if index < 0 or index >= len(self.image_paths):
+            return
         path = self.image_paths[index]
         metadata = self._get_metadata_cached(path)
         panel = self._build_details_view(path, metadata)
@@ -1857,6 +1993,8 @@ class ImageMetadataViewer(tk.Tk):
         self._set_metadata_text(panel)
 
     def open_full_preview(self, index: int) -> None:
+        if index < 0 or index >= len(self.image_paths):
+            return
         path = self.image_paths[index]
         PreviewWindow(self, path)
 
@@ -2898,6 +3036,15 @@ class ImageMetadataViewer(tk.Tk):
         except Exception:
             return 0.0
 
+    def _sort_mtime_cached(self, path: Path) -> float:
+        key = str(path)
+        cached = self.file_mtime_cache.get(key)
+        if cached is not None:
+            return cached
+        mtime = self._safe_mtime(path)
+        self.file_mtime_cache[key] = mtime
+        return mtime
+
     @staticmethod
     def _file_signature(path: Path) -> tuple[int, int]:
         try:
@@ -3024,6 +3171,7 @@ class ImageMetadataViewer(tk.Tk):
                     self.meta_text.tag_add(block_tag, f"{line_no}.0", f"{end_line}.end")
 
     def _on_close(self) -> None:
+        self._scan_token += 1
         self._cancel_metadata_warmup()
         if self._thumb_render_after_id is not None:
             self.after_cancel(self._thumb_render_after_id)
