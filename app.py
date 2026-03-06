@@ -1,14 +1,20 @@
 import json
+import os
 import re
+import subprocess
+import tempfile
 import threading
 import tkinter as tk
 import ctypes
 import sys
 import zlib
+import webbrowser
 from collections import OrderedDict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 from PIL import Image, ImageOps, ImageTk
 
@@ -22,6 +28,11 @@ THUMB_LAYOUT_UPDATE_EVERY_BATCHES = 3
 STATE_SAVE_DEBOUNCE_MS = 420
 METADATA_WARMUP_BATCH = 64
 METADATA_PARSE_REV = 3
+APP_VERSION = "3.0.0"
+UPDATE_REPO_OWNER = "ixxeg"
+UPDATE_REPO_NAME = "PromptLens"
+GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases/latest"
+GITHUB_RELEASES_PAGE = f"https://github.com/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases"
 
 
 def get_app_dir() -> Path:
@@ -37,6 +48,9 @@ PALETTE = {
     "panel": "#ede6fa",
     "surface": "#ffffff",
     "surface_alt": "#f6f1ff",
+    "surface_1": "#ffffff",
+    "surface_2": "#f7f2ff",
+    "surface_3": "#efe7fb",
     "gradient_top": "#f7f2ff",
     "gradient_mid": "#f2eafb",
     "gradient_bottom": "#ede4f9",
@@ -45,10 +59,14 @@ PALETTE = {
     "accent": "#8f79d8",
     "accent_hover": "#9f8ae4",
     "accent_active": "#7e66cb",
+    "accent_muted": "#c8b9ea",
     "border": "#d7caee",
+    "focus_ring": "#a08bd8",
     "danger": "#b54b7e",
     "chip_bg": "#ece3fb",
     "chip_fg": "#4a3680",
+    "chip_soft_bg": "#f1e9ff",
+    "chip_soft_fg": "#5f4f86",
     "glass_prompt": "#f4efff",
     "glass_negative": "#faedf5",
     "glass_main": "#f0ecff",
@@ -63,6 +81,8 @@ PALETTE = {
     "status_ok": "#6f9f8a",
     "status_warn": "#b08f65",
     "status_error": "#b54b7e",
+    "skeleton_base": "#ebe2fb",
+    "skeleton_shine": "#f5efff",
 }
 SUBFOLDER_DOT_COLORS = [
     "#8a63d2",
@@ -224,6 +244,7 @@ class ImageMetadataViewer(tk.Tk):
         self.configure(background=PALETTE["bg"])
         self.style = ttk.Style(self)
         self._setup_styles()
+        self._build_main_menu()
 
         self.selected_dirs: list[Path] = []
         self.all_image_paths: list[Path] = []
@@ -239,6 +260,7 @@ class ImageMetadataViewer(tk.Tk):
         self.folders_panel_visible = True
         self.image_root_map: dict[str, Path] = {}
         self._scan_roots_snapshot: list[Path] = []
+        self._update_check_in_progress = False
 
         self.thumb_size_var = tk.DoubleVar(value=float(DEFAULT_THUMB_SIZE))
         self.columns_var = tk.StringVar(value=str(DEFAULT_COLUMNS))
@@ -285,6 +307,10 @@ class ImageMetadataViewer(tk.Tk):
         self._hover_path_key: str | None = None
         self._folder_tip_win: tk.Toplevel | None = None
         self._folder_tip_label: tk.Label | None = None
+        self.summary_chip_frames: dict[str, tk.Frame] = {}
+        self._summary_flash_after_ids: dict[str, str] = {}
+        self._summary_chip_hovered: dict[str, bool] = {}
+        self._summary_chip_hover_border = self._mix_hex(PALETTE["accent_muted"], PALETTE["accent"], 0.75)
 
         self._load_state()
         self._thumb_last_applied_size = max(100, min(320, int(round(self.thumb_size_var.get()))))
@@ -302,7 +328,7 @@ class ImageMetadataViewer(tk.Tk):
         self.style.configure(".", background=PALETTE["bg"], foreground=PALETTE["text"])
         self.style.configure("Root.TFrame", background=PALETTE["bg"])
         self.style.configure("Panel.TFrame", background=PALETTE["panel"])
-        self.style.configure("Surface.TFrame", background=PALETTE["surface"])
+        self.style.configure("Surface.TFrame", background=PALETTE["surface_1"])
         self.style.configure(
             "TLabel",
             background=PALETTE["bg"],
@@ -349,7 +375,7 @@ class ImageMetadataViewer(tk.Tk):
         )
         self.style.configure(
             "Soft.TButton",
-            background=PALETTE["surface"],
+            background=PALETTE["surface_1"],
             foreground=PALETTE["text"],
             bordercolor=PALETTE["border"],
             padding=(14, 8),
@@ -358,7 +384,7 @@ class ImageMetadataViewer(tk.Tk):
         )
         self.style.map(
             "Soft.TButton",
-            background=[("active", PALETTE["surface_alt"]), ("pressed", "#e4daf7")],
+            background=[("active", PALETTE["surface_2"]), ("pressed", "#e4daf7")],
             bordercolor=[("active", PALETTE["accent"])],
         )
         self.style.configure(
@@ -385,7 +411,7 @@ class ImageMetadataViewer(tk.Tk):
         )
         self.style.configure(
             "TEntry",
-            fieldbackground=PALETTE["surface"],
+            fieldbackground=PALETTE["surface_1"],
             foreground=PALETTE["text"],
             bordercolor=PALETTE["border"],
             padding=6,
@@ -393,7 +419,7 @@ class ImageMetadataViewer(tk.Tk):
         )
         self.style.configure(
             "TCombobox",
-            fieldbackground=PALETTE["surface"],
+            fieldbackground=PALETTE["surface_1"],
             foreground=PALETTE["text"],
             bordercolor=PALETTE["border"],
             arrowcolor=PALETTE["text"],
@@ -407,7 +433,7 @@ class ImageMetadataViewer(tk.Tk):
         )
         self.style.configure(
             "MiniSoft.TButton",
-            background=PALETTE["surface"],
+            background=PALETTE["surface_1"],
             foreground=PALETTE["text"],
             bordercolor=PALETTE["border"],
             padding=(8, 3),
@@ -416,9 +442,235 @@ class ImageMetadataViewer(tk.Tk):
         )
         self.style.map(
             "MiniSoft.TButton",
-            background=[("active", PALETTE["surface_alt"]), ("pressed", "#e4daf7")],
+            background=[("active", PALETTE["surface_2"]), ("pressed", "#e4daf7")],
             bordercolor=[("active", PALETTE["accent"])],
         )
+        self.style.configure(
+            "ChipTitle.TLabel",
+            background=PALETTE["chip_soft_bg"],
+            foreground=PALETTE["muted"],
+            font=("Segoe UI Semibold", 8),
+        )
+        self.style.configure(
+            "ChipValue.TLabel",
+            background=PALETTE["chip_soft_bg"],
+            foreground=PALETTE["chip_soft_fg"],
+            font=("Segoe UI Semibold", 10),
+        )
+
+    def _build_main_menu(self) -> None:
+        menubar = tk.Menu(self)
+        app_menu = tk.Menu(menubar, tearoff=0)
+        app_menu.add_command(label="Check for updates", command=self.check_for_updates)
+        app_menu.add_separator()
+        app_menu.add_command(label="Open Releases page", command=self._open_releases_page)
+        menubar.add_cascade(label="App", menu=app_menu)
+        self.config(menu=menubar)
+
+    def check_for_updates(self) -> None:
+        if self._update_check_in_progress:
+            self._set_status("Update check already in progress...", "info")
+            return
+        self._update_check_in_progress = True
+        self._set_status("Checking latest release...", "busy")
+        threading.Thread(target=self._update_check_worker, daemon=True).start()
+
+    def _update_check_worker(self) -> None:
+        try:
+            req = urlrequest.Request(
+                GITHUB_LATEST_RELEASE_API,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": f"PromptLens/{APP_VERSION}",
+                },
+            )
+            with urlrequest.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if not isinstance(payload, dict):
+                raise RuntimeError("Unexpected response from GitHub API.")
+            tag_name = str(payload.get("tag_name", "")).strip()
+            html_url = str(payload.get("html_url", "")).strip() or GITHUB_RELEASES_PAGE
+            assets = payload.get("assets", [])
+            if not isinstance(assets, list):
+                assets = []
+
+            latest = tag_name.lstrip("vV")
+            if not latest:
+                raise RuntimeError("Could not detect latest version tag.")
+            if not self._is_newer_version(latest, APP_VERSION):
+                self.after(0, lambda: self._on_update_check_finished("You already have the latest version.", "ok"))
+                return
+
+            asset_url, asset_name = self._choose_release_asset(assets)
+            if not asset_url:
+                self.after(
+                    0,
+                    lambda: self._on_update_check_no_asset(latest, html_url),
+                )
+                return
+
+            self.after(
+                0,
+                lambda: self._on_update_available(latest, asset_url, asset_name, html_url),
+            )
+        except (urlerror.URLError, TimeoutError) as exc:
+            self.after(0, lambda: self._on_update_check_finished(f"Update check failed: {exc}", "error"))
+        except Exception as exc:  # noqa: BLE001
+            self.after(0, lambda: self._on_update_check_finished(f"Update check failed: {exc}", "error"))
+
+    @staticmethod
+    def _version_tuple(value: str) -> tuple[int, ...]:
+        clean = value.strip().lstrip("vV")
+        parts: list[int] = []
+        for part in clean.split("."):
+            digits = "".join(ch for ch in part if ch.isdigit())
+            if digits:
+                parts.append(int(digits))
+            else:
+                parts.append(0)
+        return tuple(parts)
+
+    def _is_newer_version(self, candidate: str, current: str) -> bool:
+        return self._version_tuple(candidate) > self._version_tuple(current)
+
+    def _choose_release_asset(self, assets: list[object]) -> tuple[str, str]:
+        entries: list[tuple[str, str]] = []
+        for item in assets:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            url = str(item.get("browser_download_url", "")).strip()
+            if name and url:
+                entries.append((name, url))
+        if not entries:
+            return "", ""
+
+        current_name = Path(sys.executable).name.lower() if getattr(sys, "frozen", False) else ""
+        if current_name:
+            for name, url in entries:
+                if name.lower() == current_name:
+                    return url, name
+        for name, url in entries:
+            if name.lower().endswith(".exe"):
+                return url, name
+        for name, url in entries:
+            if name.lower().endswith(".zip"):
+                return url, name
+        return entries[0][1], entries[0][0]
+
+    def _on_update_check_no_asset(self, latest: str, release_url: str) -> None:
+        self._update_check_in_progress = False
+        self._set_status(f"Latest version {latest} found, but no downloadable asset was detected.", "warn")
+        if messagebox.askyesno(
+            "Update",
+            f"New version {latest} is available, but no .exe asset was found.\nOpen Releases page?",
+        ):
+            webbrowser.open(release_url)
+
+    def _on_update_available(self, latest: str, asset_url: str, asset_name: str, release_url: str) -> None:
+        self._update_check_in_progress = False
+        self._set_status(f"Update available: {latest}", "info")
+        if not getattr(sys, "frozen", False):
+            if messagebox.askyesno(
+                "Update available",
+                f"Version {latest} is available.\n\nRunning from source mode now.\nOpen Releases page?",
+            ):
+                webbrowser.open(release_url)
+            return
+
+        if asset_name.lower().endswith(".zip"):
+            if messagebox.askyesno(
+                "Update available",
+                f"Version {latest} is available.\nRelease asset is a ZIP package.\nOpen Releases page?",
+            ):
+                webbrowser.open(release_url)
+            return
+
+        should_update = messagebox.askyesno(
+            "Update available",
+            f"Version {latest} is available.\n\nInstall update now?\n(The app will restart.)",
+        )
+        if not should_update:
+            return
+
+        self._update_check_in_progress = True
+        self._set_status(f"Downloading update {latest}...", "busy")
+        threading.Thread(
+            target=self._download_update_worker,
+            args=(asset_url, asset_name),
+            daemon=True,
+        ).start()
+
+    def _download_update_worker(self, asset_url: str, asset_name: str) -> None:
+        try:
+            app_dir = get_app_dir()
+            safe_name = Path(asset_name).name
+            download_path = app_dir / f".update_{safe_name}.download"
+            req = urlrequest.Request(
+                asset_url,
+                headers={"User-Agent": f"PromptLens/{APP_VERSION}"},
+            )
+            with urlrequest.urlopen(req, timeout=60) as resp, open(download_path, "wb") as out:
+                out.write(resp.read())
+            self.after(0, lambda: self._apply_downloaded_update(download_path))
+        except Exception as exc:  # noqa: BLE001
+            self.after(0, lambda: self._on_update_check_finished(f"Download failed: {exc}", "error"))
+
+    def _apply_downloaded_update(self, downloaded_file: Path) -> None:
+        self._update_check_in_progress = False
+        if not getattr(sys, "frozen", False):
+            self._set_status("Update downloaded, but auto-install works only in EXE mode.", "warn")
+            return
+        target_exe = Path(sys.executable).resolve()
+        if downloaded_file.suffix.lower() != ".download":
+            self._set_status("Downloaded update has unexpected format.", "error")
+            return
+        new_exe = downloaded_file.with_suffix("")
+        try:
+            if new_exe.exists():
+                new_exe.unlink()
+            downloaded_file.rename(new_exe)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Cannot prepare update file: {exc}", "error")
+            return
+
+        script_path = Path(tempfile.gettempdir()) / f"promptlens_updater_{os.getpid()}.cmd"
+        script_text = (
+            "@echo off\r\n"
+            "setlocal\r\n"
+            f"set TARGET={target_exe}\r\n"
+            f"set NEWFILE={new_exe}\r\n"
+            ":retry\r\n"
+            "move /Y \"%NEWFILE%\" \"%TARGET%\" >nul 2>nul\r\n"
+            "if errorlevel 1 (\r\n"
+            "  timeout /t 1 /nobreak >nul\r\n"
+            "  goto retry\r\n"
+            ")\r\n"
+            "start \"\" \"%TARGET%\"\r\n"
+            "del \"%~f0\"\r\n"
+        )
+        try:
+            script_path.write_text(script_text, encoding="utf-8")
+            subprocess.Popen(
+                ["cmd", "/c", str(script_path)],
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+            )
+            self._set_status("Installing update and restarting...", "busy")
+            self.after(200, self._on_close)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Cannot run updater: {exc}", "error")
+
+    def _on_update_check_finished(self, text: str, kind: str) -> None:
+        self._update_check_in_progress = False
+        self._set_status(text, kind)
+        if kind == "error":
+            messagebox.showerror("Update", text)
+        elif kind == "ok":
+            messagebox.showinfo("Update", text)
+
+    @staticmethod
+    def _open_releases_page() -> None:
+        webbrowser.open(GITHUB_RELEASES_PAGE)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -430,7 +682,7 @@ class ImageMetadataViewer(tk.Tk):
 
         header_shell = tk.Frame(
             top,
-            bg=PALETTE["gradient_top"],
+            bg=PALETTE["surface_2"],
             highlightthickness=1,
             highlightbackground=PALETTE["border"],
             bd=0,
@@ -440,13 +692,13 @@ class ImageMetadataViewer(tk.Tk):
         header_shell.grid(row=0, column=0, sticky="ew")
         header_shell.columnconfigure(0, weight=1)
 
-        controls_row = tk.Frame(header_shell, bg=PALETTE["gradient_top"])
+        controls_row = tk.Frame(header_shell, bg=PALETTE["surface_2"])
         controls_row.grid(row=0, column=0, sticky="ew")
         controls_row.columnconfigure(0, weight=1)
 
-        controls_left = tk.Frame(controls_row, bg=PALETTE["gradient_top"])
+        controls_left = tk.Frame(controls_row, bg=PALETTE["surface_2"])
         controls_left.grid(row=0, column=0, sticky="w")
-        controls_right = tk.Frame(controls_row, bg=PALETTE["gradient_top"])
+        controls_right = tk.Frame(controls_row, bg=PALETTE["surface_2"])
         controls_right.grid(row=0, column=1, sticky="e")
 
         self.add_btn = ttk.Button(controls_left, text="[+] Add folder", command=self.add_folder, style="Soft.TButton")
@@ -456,7 +708,7 @@ class ImageMetadataViewer(tk.Tk):
         self.folders_toggle_btn = ttk.Button(controls_left, text="[F] Hide folders", command=self._toggle_folders_panel, style="Soft.TButton")
         self.folders_toggle_btn.pack(side="left", padx=(0, 12))
         self.scan_btn = ttk.Button(controls_left, text="[S] Scan", command=self.scan_images, style="Accent.TButton")
-        self.scan_btn.pack(side="left", padx=(0, 12))
+        self.scan_btn.pack(side="left", padx=(0, 8))
         self._enable_button_hover_animation(self.add_btn, is_accent=False)
         self._enable_button_hover_animation(self.clear_btn, is_accent=False)
         self._enable_button_hover_animation(self.folders_toggle_btn, is_accent=False)
@@ -465,7 +717,7 @@ class ImageMetadataViewer(tk.Tk):
         tk.Label(
             controls_right,
             text="Thumb size",
-            bg=PALETTE["gradient_top"],
+            bg=PALETTE["surface_2"],
             fg=PALETTE["muted"],
             font=("Segoe UI", 9),
         ).pack(side="left", padx=(0, 6))
@@ -482,7 +734,7 @@ class ImageMetadataViewer(tk.Tk):
         tk.Label(
             controls_right,
             text="Columns",
-            bg=PALETTE["gradient_top"],
+            bg=PALETTE["surface_2"],
             fg=PALETTE["muted"],
             font=("Segoe UI", 9),
         ).pack(side="left", padx=(0, 6))
@@ -499,16 +751,16 @@ class ImageMetadataViewer(tk.Tk):
         self.columns_spin.bind("<Return>", lambda _e: self._apply_layout_change())
         self.columns_spin.bind("<FocusOut>", lambda _e: self._apply_layout_change())
 
-        filter_row = tk.Frame(header_shell, bg=PALETTE["gradient_mid"])
+        filter_row = tk.Frame(header_shell, bg=PALETTE["surface_3"])
         filter_row.grid(row=1, column=0, sticky="ew", pady=(8, 0), padx=2)
         filter_row.columnconfigure(1, weight=1)
 
-        tk.Label(filter_row, text="Search", bg=PALETTE["gradient_mid"], fg=PALETTE["muted"], font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
+        tk.Label(filter_row, text="Search", bg=PALETTE["surface_3"], fg=PALETTE["muted"], font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
         self.search_entry = ttk.Entry(filter_row, textvariable=self.search_var)
         self.search_entry.grid(row=0, column=1, sticky="ew", padx=(8, 10))
         self.search_entry.bind("<KeyRelease>", lambda _e: self._schedule_apply_filters())
 
-        tk.Label(filter_row, text="Prompt tag", bg=PALETTE["gradient_mid"], fg=PALETTE["muted"], font=("Segoe UI", 9)).grid(row=0, column=2, sticky="e", padx=(0, 6))
+        tk.Label(filter_row, text="Prompt tag", bg=PALETTE["surface_3"], fg=PALETTE["muted"], font=("Segoe UI", 9)).grid(row=0, column=2, sticky="e", padx=(0, 6))
         self.tag_entry = ttk.Entry(filter_row, textvariable=self.tag_filter_var, width=18)
         self.tag_entry.grid(row=0, column=3, sticky="w", padx=(0, 10))
         self.tag_entry.bind("<KeyRelease>", lambda _e: self._schedule_apply_filters())
@@ -518,18 +770,18 @@ class ImageMetadataViewer(tk.Tk):
             text="Favorites only",
             variable=self.favorites_only_var,
             command=self.apply_filters,
-            bg=PALETTE["gradient_mid"],
+            bg=PALETTE["surface_3"],
             fg=PALETTE["text"],
-            activebackground=PALETTE["gradient_mid"],
+            activebackground=PALETTE["surface_3"],
             activeforeground=PALETTE["text"],
-            selectcolor=PALETTE["surface"],
+            selectcolor=PALETTE["surface_1"],
             font=("Segoe UI", 10),
             bd=0,
             highlightthickness=0,
         )
         self.favorites_only_chk.grid(row=0, column=4, sticky="w", padx=(0, 10))
 
-        tk.Label(filter_row, text="Sort", bg=PALETTE["gradient_mid"], fg=PALETTE["muted"], font=("Segoe UI", 9)).grid(row=0, column=5, sticky="e", padx=(0, 6))
+        tk.Label(filter_row, text="Sort", bg=PALETTE["surface_3"], fg=PALETTE["muted"], font=("Segoe UI", 9)).grid(row=0, column=5, sticky="e", padx=(0, 6))
         self.sort_combo = ttk.Combobox(
             filter_row,
             textvariable=self.sort_var,
@@ -546,7 +798,7 @@ class ImageMetadataViewer(tk.Tk):
 
         self.folders_panel = tk.Frame(
             header_shell,
-            bg=PALETTE["surface"],
+            bg=PALETTE["surface_1"],
             highlightthickness=1,
             highlightbackground=PALETTE["border"],
             bd=0,
@@ -556,11 +808,11 @@ class ImageMetadataViewer(tk.Tk):
         self.folders_panel.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self.folders_panel.columnconfigure(0, weight=1)
 
-        self.folders_container = tk.Frame(self.folders_panel, bg=PALETTE["surface"], bd=0)
+        self.folders_container = tk.Frame(self.folders_panel, bg=PALETTE["surface_1"], bd=0)
         self.folders_container.grid(row=0, column=0, sticky="ew")
         self.status_pill = tk.Frame(
             header_shell,
-            bg=PALETTE["surface_alt"],
+            bg=PALETTE["surface_2"],
             highlightthickness=1,
             highlightbackground=PALETTE["border"],
             bd=0,
@@ -572,7 +824,7 @@ class ImageMetadataViewer(tk.Tk):
             self.status_pill,
             width=10,
             height=10,
-            bg=PALETTE["surface_alt"],
+            bg=PALETTE["surface_2"],
             highlightthickness=0,
             bd=0,
         )
@@ -581,7 +833,7 @@ class ImageMetadataViewer(tk.Tk):
         self.status_label = tk.Label(
             self.status_pill,
             textvariable=self.status_var,
-            bg=PALETTE["surface_alt"],
+            bg=PALETTE["surface_2"],
             fg=PALETTE["muted"],
             font=("Segoe UI", 9),
         )
@@ -608,7 +860,7 @@ class ImageMetadataViewer(tk.Tk):
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1)
 
-        self.canvas = tk.Canvas(left, highlightthickness=0, background=PALETTE["panel"])
+        self.canvas = tk.Canvas(left, highlightthickness=0, background=PALETTE["surface_3"])
         self.v_scroll = ttk.Scrollbar(left, orient="vertical", command=self.canvas.yview)
         self.h_scroll = ttk.Scrollbar(left, orient="horizontal", command=self.canvas.xview)
         self.canvas.configure(yscrollcommand=self.v_scroll.set, xscrollcommand=self.h_scroll.set)
@@ -627,7 +879,7 @@ class ImageMetadataViewer(tk.Tk):
         self.h_scroll.grid(row=1, column=0, sticky="ew")
 
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(2, weight=1)
+        right.rowconfigure(3, weight=1)
 
         ttk.Label(right, text="Metadata", style="Title.TLabel").grid(row=0, column=0, sticky="w")
 
@@ -652,8 +904,74 @@ class ImageMetadataViewer(tk.Tk):
         self.save_tags_btn.grid(row=1, column=2, sticky="e")
         self._enable_button_hover_animation(self.save_tags_btn, is_accent=False)
 
+        self.inspector_summary = tk.Frame(
+            right,
+            bg=PALETTE["surface_2"],
+            highlightthickness=1,
+            highlightbackground=PALETTE["border"],
+            bd=0,
+            padx=10,
+            pady=8,
+        )
+        self.inspector_summary.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self.inspector_summary.columnconfigure(0, weight=1)
+        self.inspector_summary.columnconfigure(1, weight=1)
+        self.inspector_summary.columnconfigure(2, weight=1)
+
+        self.meta_file_var = tk.StringVar(value="No image selected")
+        self.meta_path_var = tk.StringVar(value="")
+        tk.Label(
+            self.inspector_summary,
+            textvariable=self.meta_file_var,
+            bg=PALETTE["surface_2"],
+            fg=PALETTE["text"],
+            font=("Segoe UI Semibold", 10),
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=3, sticky="ew")
+        tk.Label(
+            self.inspector_summary,
+            textvariable=self.meta_path_var,
+            bg=PALETTE["surface_2"],
+            fg=PALETTE["muted"],
+            font=("Segoe UI", 8),
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
+        self.summary_value_vars: dict[str, tk.StringVar] = {
+            "Model": tk.StringVar(value="-"),
+            "Sampler": tk.StringVar(value="-"),
+            "Steps": tk.StringVar(value="-"),
+            "CFG": tk.StringVar(value="-"),
+            "Resolution": tk.StringVar(value="-"),
+            "Size": tk.StringVar(value="-"),
+        }
+        summary_fields = ["Model", "Sampler", "Steps", "CFG", "Resolution", "Size"]
+        for idx, field in enumerate(summary_fields):
+            row = 2 + (idx // 3)
+            col = idx % 3
+            chip = tk.Frame(
+                self.inspector_summary,
+                bg=PALETTE["chip_soft_bg"],
+                highlightthickness=2,
+                highlightbackground=PALETTE["accent_muted"],
+                bd=0,
+                padx=8,
+                pady=5,
+            )
+            chip.grid(row=row, column=col, sticky="ew", padx=3, pady=3)
+            self.summary_chip_frames[field] = chip
+            self._summary_chip_hovered[field] = False
+            title_label = ttk.Label(chip, text=field, style="ChipTitle.TLabel", anchor="w")
+            title_label.pack(anchor="w")
+            value_label = ttk.Label(chip, textvariable=self.summary_value_vars[field], style="ChipValue.TLabel", anchor="w")
+            value_label.pack(anchor="w")
+            for widget in (chip, title_label, value_label):
+                widget.bind("<Button-1>", lambda _e, f=field: self._copy_summary_value(f), add="+")
+                widget.bind("<Enter>", lambda _e, w=widget, f=field: self._on_summary_widget_enter(w, f), add="+")
+                widget.bind("<Leave>", lambda _e, w=widget, f=field: self._on_summary_widget_leave(w, f), add="+")
+
         meta_wrap = ttk.Frame(right, style="Surface.TFrame")
-        meta_wrap.grid(row=2, column=0, sticky="nsew", pady=(0, 0))
+        meta_wrap.grid(row=3, column=0, sticky="nsew", pady=(0, 0))
         meta_wrap.columnconfigure(0, weight=1)
         meta_wrap.rowconfigure(0, weight=1)
 
@@ -663,13 +981,13 @@ class ImageMetadataViewer(tk.Tk):
             font=("Segoe UI", 10),
             padx=14,
             pady=14,
-            bg=PALETTE["surface"],
+            bg=PALETTE["surface_1"],
             fg=PALETTE["text"],
             insertbackground=PALETTE["text"],
             relief="flat",
             highlightthickness=1,
             highlightbackground=PALETTE["border"],
-            highlightcolor=PALETTE["accent"],
+            highlightcolor=PALETTE["focus_ring"],
         )
         self.meta_scroll = ttk.Scrollbar(meta_wrap, orient="vertical", command=self.meta_text.yview)
         self.meta_text.configure(yscrollcommand=self.meta_scroll.set)
@@ -744,7 +1062,7 @@ class ImageMetadataViewer(tk.Tk):
             tk.Label(
                 self.folders_container,
                 text="No folders selected",
-                bg=PALETTE["surface"],
+                bg=PALETTE["surface_1"],
                 fg=PALETTE["muted"],
                 font=("Segoe UI", 10),
                 anchor="w",
@@ -752,14 +1070,14 @@ class ImageMetadataViewer(tk.Tk):
             return
 
         for idx, path in enumerate(self.selected_dirs):
-            row = tk.Frame(self.folders_container, bg=PALETTE["surface"], bd=0)
+            row = tk.Frame(self.folders_container, bg=PALETTE["surface_1"], bd=0)
             row.grid(row=idx, column=0, sticky="ew", pady=1)
             row.columnconfigure(0, weight=1)
 
             tk.Label(
                 row,
                 text=str(path),
-                bg=PALETTE["surface"],
+                bg=PALETTE["surface_1"],
                 fg=PALETTE["text"],
                 font=("Consolas", 10),
                 anchor="w",
@@ -1201,8 +1519,8 @@ class ImageMetadataViewer(tk.Tk):
 
         self._thumb_render_size = max(100, min(320, int(round(self.thumb_size_var.get()))))
         self._thumb_render_columns = self._safe_columns()
-        name_font = tkfont.Font(family="Segoe UI", size=10)
-        name_line_h = int(name_font.metrics("linespace"))
+        self._thumb_name_font = tkfont.Font(family="Segoe UI", size=10)
+        name_line_h = int(self._thumb_name_font.metrics("linespace"))
         self._thumb_show_caption = self._thumb_render_size >= 150
         self._thumb_caption_height = max(24, name_line_h + 10) if self._thumb_show_caption else 0
         self._thumb_inner_pad = 6
@@ -1216,6 +1534,7 @@ class ImageMetadataViewer(tk.Tk):
         self._thumb_cell_gap_x = 3
         self._thumb_cell_gap_y = 3
         self._thumb_render_index = 0
+        self._render_skeleton_grid(len(self.image_paths))
         self._set_status(f"Rendering thumbnails: 0 / {len(self.image_paths)} ...", "busy")
         self._render_thumbnail_batch(token)
 
@@ -1282,6 +1601,7 @@ class ImageMetadataViewer(tk.Tk):
         self._refresh_thumb_cell_highlight()
 
     def _create_thumbnail_cell(self, path: Path, idx: int, row: int, col: int, size: int) -> None:
+        self.canvas.delete(f"skel_idx_{idx}")
         x0 = col * (self._thumb_cell_width + self._thumb_cell_gap_x)
         y0 = row * (self._thumb_cell_height + self._thumb_cell_gap_y)
         x1 = x0 + self._thumb_cell_width
@@ -1326,14 +1646,14 @@ class ImageMetadataViewer(tk.Tk):
         text_item: int | None = None
         if caption_h > 0:
             caption_width = max(36, self._thumb_cell_width - 12)
-            max_name = max(8, int(caption_width / 7.2))
+            font_obj = getattr(self, "_thumb_name_font", tkfont.Font(family="Segoe UI", size=10))
+            caption_text = self._truncate_to_pixel_width(path.name, caption_width, font_obj)
             text_item = self.canvas.create_text(
                 img_x,
                 iy0 + pad + size + (caption_h / 2),
-                text=self._truncate(path.name, max_name),
-                width=caption_width,
+                text=caption_text,
                 fill=PALETTE["text"],
-                font=("Segoe UI", 10),
+                font=font_obj,
                 anchor="center",
                 tags=tags,
             )
@@ -1421,6 +1741,69 @@ class ImageMetadataViewer(tk.Tk):
         self.canvas.tag_bind(tag, "<Leave>", lambda _evt, p=path: self._on_thumb_hover(p, False))
 
         self.thumbnail_refs.append(thumb_img)
+
+    def _render_skeleton_grid(self, total_count: int) -> None:
+        if total_count <= 0:
+            return
+        columns = max(1, self._thumb_render_columns)
+        # Keep skeleton lightweight: render for initial viewport area only.
+        max_skeleton = min(total_count, columns * 18)
+        pad = int(getattr(self, "_thumb_inner_pad", 6))
+        caption_h = int(getattr(self, "_thumb_caption_height", 0))
+        size = int(self._thumb_render_size)
+        for idx in range(max_skeleton):
+            row = idx // columns
+            col = idx % columns
+            x0 = col * (self._thumb_cell_width + self._thumb_cell_gap_x)
+            y0 = row * (self._thumb_cell_height + self._thumb_cell_gap_y)
+            x1 = x0 + self._thumb_cell_width
+            y1 = y0 + self._thumb_cell_height
+            sx0 = x0 + 1
+            sy0 = y0 + 1
+            sx1 = x1 - 1
+            sy1 = y1 - 1
+            skel_tag = f"skel_idx_{idx}"
+            tags = ("thumb_item", "thumb_skeleton", skel_tag)
+            base_fill = PALETTE["skeleton_base"] if (idx % 2 == 0) else self._mix_hex(PALETTE["skeleton_base"], PALETTE["surface_2"], 0.35)
+            self.canvas.create_rectangle(
+                x0,
+                y0,
+                x1,
+                y1,
+                fill=PALETTE["thumb_shadow"],
+                outline=PALETTE["thumb_shadow"],
+                width=1,
+                tags=tags,
+            )
+            self.canvas.create_rectangle(
+                sx0,
+                sy0,
+                sx1,
+                sy1,
+                fill=base_fill,
+                outline=PALETTE["border"],
+                width=1,
+                tags=tags,
+            )
+            self.canvas.create_rectangle(
+                sx0 + pad,
+                sy0 + pad,
+                sx1 - pad,
+                sy0 + pad + size,
+                fill=PALETTE["skeleton_shine"],
+                outline="",
+                tags=tags,
+            )
+            if caption_h > 0:
+                self.canvas.create_rectangle(
+                    sx0 + pad,
+                    sy0 + pad + size + 6,
+                    sx1 - pad,
+                    sy0 + pad + size + max(8, caption_h - 4),
+                    fill=PALETTE["skeleton_shine"],
+                    outline="",
+                    tags=tags,
+                )
 
     def _update_canvas_window_size(self) -> None:
         columns = max(1, getattr(self, "_thumb_render_columns", self._safe_columns()))
@@ -1542,6 +1925,69 @@ class ImageMetadataViewer(tk.Tk):
         self.clipboard_append(prompt)
         self._set_status("Positive prompt copied to clipboard", "ok")
 
+    def _copy_summary_value(self, field: str) -> None:
+        value_var = self.summary_value_vars.get(field)
+        value = value_var.get().strip() if value_var is not None else ""
+        if not value or value == "-":
+            self._set_status(f"{field}: nothing to copy", "warn")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self._set_status(f"{field} copied to clipboard", "ok")
+        self._flash_summary_chip(field)
+
+    def _on_summary_widget_enter(self, widget: tk.Misc, field: str) -> None:
+        try:
+            widget.configure(cursor="hand2")
+        except Exception:
+            pass
+        self._on_summary_chip_hover(field, entering=True)
+
+    def _on_summary_widget_leave(self, widget: tk.Misc, field: str) -> None:
+        try:
+            widget.configure(cursor="")
+        except Exception:
+            pass
+        self._on_summary_chip_hover(field, entering=False)
+
+    def _on_summary_chip_hover(self, field: str, entering: bool) -> None:
+        chip = self.summary_chip_frames.get(field)
+        if chip is None or not chip.winfo_exists():
+            return
+        self._summary_chip_hovered[field] = entering
+        if field in self._summary_flash_after_ids:
+            return
+        chip.configure(
+            highlightbackground=(self._summary_chip_hover_border if entering else PALETTE["accent_muted"]),
+        )
+
+    def _flash_summary_chip(self, field: str) -> None:
+        chip = self.summary_chip_frames.get(field)
+        if chip is None or not chip.winfo_exists():
+            return
+
+        pending = self._summary_flash_after_ids.get(field)
+        if pending is not None:
+            try:
+                self.after_cancel(pending)
+            except Exception:
+                pass
+
+        chip.configure(highlightbackground=PALETTE["accent"])
+
+        def restore() -> None:
+            self._summary_flash_after_ids.pop(field, None)
+            if chip.winfo_exists():
+                chip.configure(
+                    highlightbackground=(
+                        self._summary_chip_hover_border
+                        if self._summary_chip_hovered.get(field, False)
+                        else PALETTE["accent_muted"]
+                    )
+                )
+
+        self._summary_flash_after_ids[field] = self.after(240, restore)
+
     def toggle_current_favorite(self) -> None:
         if not self.current_image_path:
             messagebox.showinfo("No image selected", "Select an image first.")
@@ -1573,6 +2019,7 @@ class ImageMetadataViewer(tk.Tk):
             self.copy_prompt_btn.configure(state="disabled")
             self.favorite_btn.configure(state="disabled")
             self.save_tags_btn.configure(state="disabled")
+            self._update_inspector_summary(None, None)
             return
 
         self.copy_prompt_btn.configure(state="normal")
@@ -1583,6 +2030,42 @@ class ImageMetadataViewer(tk.Tk):
         self.favorite_btn.configure(text="[*] Favorited" if is_favorite else "[*] Favorite")
         tags = [str(x) for x in state.get("tags", []) if str(x).strip()]
         self.current_tags_var.set(", ".join(tags))
+        self._update_inspector_summary(path, metadata)
+
+    def _update_inspector_summary(self, path: Path | None, metadata: dict[str, str] | None) -> None:
+        if path is None or metadata is None:
+            self.meta_file_var.set("No image selected")
+            self.meta_path_var.set("")
+            for var in self.summary_value_vars.values():
+                var.set("-")
+            return
+
+        self.meta_file_var.set(path.name)
+        subfolder, _color_key = self._subfolder_hint(path)
+        self.meta_path_var.set(subfolder or "Root folder")
+
+        model = self._pick(metadata, ["Model"]) or "-"
+        sampler = self._pick(metadata, ["Sampler"]) or "-"
+        steps = self._pick(metadata, ["Steps"]) or "-"
+        cfg = self._pick(metadata, ["CFG", "CFG scale"]) or "-"
+        resolution = self._pick(metadata, ["Resolution", "Size"]) or "-"
+        if resolution == "-":
+            width = self._pick(metadata, ["_width"])
+            height = self._pick(metadata, ["_height"])
+            if width and height:
+                resolution = f"{width}x{height}"
+        file_size = "-"
+        try:
+            file_size = f"{path.stat().st_size / 1024:.1f} KB"
+        except Exception:
+            pass
+
+        self.summary_value_vars["Model"].set(model)
+        self.summary_value_vars["Sampler"].set(sampler)
+        self.summary_value_vars["Steps"].set(steps)
+        self.summary_value_vars["CFG"].set(cfg)
+        self.summary_value_vars["Resolution"].set(resolution)
+        self.summary_value_vars["Size"].set(file_size)
 
     def _get_metadata_cached(self, path: Path) -> dict[str, str]:
         key = str(path)
@@ -2151,26 +2634,12 @@ class ImageMetadataViewer(tk.Tk):
         return out
 
     def _build_details_view(self, path: Path, metadata: dict[str, str]) -> str:
-        file_size_kb = path.stat().st_size / 1024
         state = self._get_image_state(path)
         user_tags = [str(x) for x in state.get("tags", []) if str(x).strip()]
         favorite_mark = "*" if bool(state.get("favorite", False)) else "-"
 
         prompt = self._pick(metadata, ["Prompt"]) or "-"
         negative_prompt = self._pick(metadata, ["Negative prompt"]) or "-"
-        model = self._pick(metadata, ["Model"]) or "-"
-        sampler = self._pick(metadata, ["Sampler"]) or "-"
-        scheduler = self._pick(metadata, ["Scheduler"]) or "-"
-        seed = self._pick(metadata, ["Seed"]) or "-"
-        cfg = self._pick(metadata, ["CFG", "CFG scale"]) or "-"
-        steps = self._pick(metadata, ["Steps"]) or "-"
-
-        resolution = self._pick(metadata, ["Resolution", "Size"]) or "-"
-        width = self._pick(metadata, ["_width"])
-        height = self._pick(metadata, ["_height"])
-        if resolution == "-" and width and height:
-            resolution = f"{width}x{height}"
-
         loras = self._extract_loras(prompt, metadata)
 
         title = f"{favorite_mark} {path.name}"
@@ -2183,16 +2652,6 @@ class ImageMetadataViewer(tk.Tk):
             f"NEGATIVE PROMPT\n"
             f"{'-' * 70}\n"
             f"{negative_prompt}\n\n"
-            f"MAIN SETTINGS\n"
-            f"{'-' * 70}\n"
-            f"Model      : {model}\n"
-            f"Sampler    : {sampler}\n"
-            f"Scheduler  : {scheduler}\n"
-            f"Seed       : {seed}\n"
-            f"CFG        : {cfg}\n"
-            f"Steps      : {steps}\n"
-            f"Resolution : {resolution}\n"
-            f"Size       : {file_size_kb:.2f} KB\n\n"
             f"LoRAs\n"
             f"{'-' * 70}\n"
             f"{loras}\n\n"
@@ -2492,8 +2951,8 @@ class ImageMetadataViewer(tk.Tk):
         )
         self.meta_text.tag_configure(
             "chip_value",
-            background=PALETTE["chip_bg"],
-            foreground=PALETTE["chip_fg"],
+            background=PALETTE["chip_soft_bg"],
+            foreground=PALETTE["chip_soft_fg"],
             font=("Segoe UI Semibold", 9),
         )
 
@@ -2514,7 +2973,6 @@ class ImageMetadataViewer(tk.Tk):
         section_styles = {
             "PROMPT": "glass_prompt",
             "NEGATIVE PROMPT": "glass_negative",
-            "MAIN SETTINGS": "glass_main",
             "LoRAs": "glass_misc",
             "Tags": "glass_misc",
         }
@@ -2529,7 +2987,7 @@ class ImageMetadataViewer(tk.Tk):
                 self.meta_text.tag_add("file_title", start, end)
                 continue
 
-            if stripped in {"PROMPT", "MAIN SETTINGS", "LoRAs", "Tags"}:
+            if stripped in {"PROMPT", "LoRAs", "Tags"}:
                 section_rows.append((i, stripped))
                 self.meta_text.tag_add("section", start, end)
                 continue
@@ -2600,6 +3058,12 @@ class ImageMetadataViewer(tk.Tk):
             except Exception:
                 pass
         self._button_anim_after_ids.clear()
+        for after_id in self._summary_flash_after_ids.values():
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+        self._summary_flash_after_ids.clear()
         if self._folder_tip_win is not None and self._folder_tip_win.winfo_exists():
             self._folder_tip_win.destroy()
             self._folder_tip_win = None
@@ -2674,7 +3138,8 @@ class ImageMetadataViewer(tk.Tk):
             return
 
         steps = 7
-        t = step / steps
+        t_linear = step / steps
+        t = 1.0 - (1.0 - t_linear) * (1.0 - t_linear)
         style_name = button.cget("style")
         bg = self._mix_hex(from_bg, to_bg, t)
         border = self._mix_hex(from_border, to_border, t)
@@ -2682,7 +3147,7 @@ class ImageMetadataViewer(tk.Tk):
 
         if step < steps:
             after_id = self.after(
-                18,
+                14,
                 lambda: self._run_button_animation(
                     button, from_bg, to_bg, from_border, to_border, token, step + 1
                 ),
@@ -2693,16 +3158,17 @@ class ImageMetadataViewer(tk.Tk):
         self.meta_text.configure(fg=self._meta_start_color)
         for tag_name in self._metadata_tag_targets:
             self.meta_text.tag_configure(tag_name, foreground=self._meta_start_color)
-        self._run_metadata_fade(step=0, total_steps=9)
+        self._run_metadata_fade(step=0, total_steps=8)
 
     def _run_metadata_fade(self, step: int, total_steps: int) -> None:
-        t = step / total_steps
+        t_linear = step / total_steps
+        t = 1.0 - (1.0 - t_linear) * (1.0 - t_linear)
         self.meta_text.configure(fg=self._mix_hex(self._meta_start_color, PALETTE["text"], t))
         for tag_name, target in self._metadata_tag_targets.items():
             self.meta_text.tag_configure(tag_name, foreground=self._mix_hex(self._meta_start_color, target, t))
 
         if step < total_steps:
-            self._meta_fade_after_id = self.after(20, lambda: self._run_metadata_fade(step + 1, total_steps))
+            self._meta_fade_after_id = self.after(16, lambda: self._run_metadata_fade(step + 1, total_steps))
         else:
             self._meta_fade_after_id = None
 
@@ -2800,6 +3266,28 @@ class ImageMetadataViewer(tk.Tk):
     @staticmethod
     def _truncate(value: str, max_len: int) -> str:
         return value if len(value) <= max_len else value[: max_len - 3] + "..."
+
+    @staticmethod
+    def _truncate_to_pixel_width(value: str, max_px: int, font_obj: tkfont.Font) -> str:
+        if max_px <= 0:
+            return ""
+        if font_obj.measure(value) <= max_px:
+            return value
+
+        ellipsis = "..."
+        ellipsis_w = font_obj.measure(ellipsis)
+        if ellipsis_w >= max_px:
+            return ""
+
+        lo = 0
+        hi = len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font_obj.measure(value[:mid]) + ellipsis_w <= max_px:
+                lo = mid
+            else:
+                hi = mid - 1
+        return value[:lo].rstrip() + ellipsis
 
 
 def main() -> None:
