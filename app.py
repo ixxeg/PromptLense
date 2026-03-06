@@ -127,7 +127,6 @@ def enable_high_dpi() -> None:
 class PreviewWindow(tk.Toplevel):
     def __init__(self, parent: tk.Tk, image_path: Path) -> None:
         super().__init__(parent)
-        self.title(f"Preview: {image_path.name}")
         self.geometry("1200x820")
 
         self.image_path = image_path
@@ -135,16 +134,21 @@ class PreviewWindow(tk.Toplevel):
         self.min_zoom = 0.1
         self.max_zoom = 8.0
         self.base_image: Image.Image | None = None
+        self._image_pyramid: list[tuple[float, Image.Image]] = []
         self.tk_image: ImageTk.PhotoImage | None = None
         self._image_item: int | None = None
-        self._last_render_key: tuple[int, int, int] | None = None
+        self._last_render_key: tuple[int, int, int, int, int] | None = None
         self._pending_zoom: float | None = None
         self._wheel_delta_accum = 0
         self._wheel_flush_after_id: str | None = None
         self._quality_after_id: str | None = None
+        self._load_token = 0
+        self._load_thread: threading.Thread | None = None
+        self.path_var = tk.StringVar(value=str(image_path))
+        self._loading_item: int | None = None
 
         self._build_ui()
-        self._load_image()
+        self.load_path(image_path)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -161,7 +165,7 @@ class PreviewWindow(tk.Toplevel):
 
         self.zoom_var = tk.StringVar(value="100%")
         ttk.Label(toolbar, textvariable=self.zoom_var).grid(row=0, column=4, padx=(0, 12))
-        ttk.Label(toolbar, text=str(self.image_path)).grid(row=0, column=7, sticky="e")
+        ttk.Label(toolbar, textvariable=self.path_var).grid(row=0, column=7, sticky="e")
 
         content = ttk.Frame(self)
         content.grid(row=1, column=0, sticky="nsew")
@@ -177,27 +181,126 @@ class PreviewWindow(tk.Toplevel):
         self.v_scroll.grid(row=0, column=1, sticky="ns")
         self.h_scroll.grid(row=1, column=0, sticky="ew")
         self._image_item = self.canvas.create_image(0, 0, anchor="nw")
+        self._loading_item = self.canvas.create_text(
+            0,
+            0,
+            text="Loading preview...",
+            fill="#f2f2f2",
+            font=("Segoe UI Semibold", 12),
+            state="hidden",
+        )
 
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         self.canvas.bind("<Button-4>", self._on_mouse_wheel)
         self.canvas.bind("<Button-5>", self._on_mouse_wheel)
         self.canvas.bind("<ButtonPress-1>", lambda e: self.canvas.scan_mark(e.x, e.y))
         self.canvas.bind("<B1-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.bind("<plus>", lambda _e: self.zoom_in())
         self.bind("<minus>", lambda _e: self.zoom_out())
         self.bind("<Control-0>", lambda _e: self.reset_zoom())
         self.bind("<F>", lambda _e: self.fit_to_window())
         self.canvas.focus_set()
 
-    def _load_image(self) -> None:
+    def load_path(self, image_path: Path) -> None:
+        self.image_path = image_path
+        self.title(f"Preview: {image_path.name}")
+        self.path_var.set(str(image_path))
+        self.zoom = 1.0
+        self._pending_zoom = None
+        self._last_render_key = None
+        self._cancel_quality_render()
+        self._start_load_image()
+
+    def _start_load_image(self) -> None:
+        self._load_token += 1
+        token = self._load_token
+        self.base_image = None
+        self._image_pyramid = []
+        self.tk_image = None
+        if self._image_item is not None:
+            self.canvas.itemconfigure(self._image_item, image="")
+        self.canvas.configure(scrollregion=(0, 0, max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())))
+        self._show_loading("Loading preview...")
+        self._load_thread = threading.Thread(
+            target=self._load_image_worker,
+            args=(self.image_path, token),
+            daemon=True,
+        )
+        self._load_thread.start()
+
+    def _load_image_worker(self, image_path: Path, token: int) -> None:
         try:
-            with Image.open(self.image_path) as im:
-                self.base_image = ImageOps.exif_transpose(im).convert("RGB")
-            # Defer one initial fit until the toplevel and canvas have a stable size.
-            self.after_idle(self._fit_once_ready)
+            with Image.open(image_path) as im:
+                base_image = ImageOps.exif_transpose(im).convert("RGB")
+            pyramid = self._build_image_pyramid(base_image)
+            self.after(0, lambda: self._on_image_loaded(token, image_path, base_image, pyramid))
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Preview error", f"Cannot open image:\n{exc}")
-            self.destroy()
+            self.after(0, lambda: self._on_image_load_failed(token, exc))
+
+    def _on_image_loaded(
+        self,
+        token: int,
+        image_path: Path,
+        base_image: Image.Image,
+        pyramid: list[tuple[float, Image.Image]],
+    ) -> None:
+        if token != self._load_token or image_path != self.image_path:
+            return
+        self.base_image = base_image
+        self._image_pyramid = pyramid
+        self._hide_loading()
+        self.after_idle(self._fit_once_ready)
+
+    def _on_image_load_failed(self, token: int, exc: Exception) -> None:
+        if token != self._load_token:
+            return
+        self._hide_loading()
+        messagebox.showerror("Preview error", f"Cannot open image:\n{exc}")
+        self.destroy()
+
+    @staticmethod
+    def _build_image_pyramid(base_image: Image.Image) -> list[tuple[float, Image.Image]]:
+        pyramid: list[tuple[float, Image.Image]] = [(1.0, base_image)]
+        current = base_image
+        scale = 1.0
+        while min(current.width, current.height) > 512:
+            next_size = (max(1, current.width // 2), max(1, current.height // 2))
+            current = current.resize(next_size, Image.Resampling.BOX)
+            scale *= 0.5
+            pyramid.append((scale, current))
+        return pyramid
+
+    def _choose_render_source(self, target_w: int, target_h: int) -> tuple[float, Image.Image]:
+        if not self._image_pyramid:
+            return 1.0, self.base_image
+        source_scale, source_image = self._image_pyramid[0]
+        for scale, image in self._image_pyramid[1:]:
+            if image.width >= target_w and image.height >= target_h:
+                source_scale, source_image = scale, image
+                continue
+            break
+        return source_scale, source_image
+
+    def _show_loading(self, text: str) -> None:
+        if self._loading_item is None:
+            return
+        self.canvas.itemconfigure(self._loading_item, text=text, state="normal")
+        self._position_loading_item()
+
+    def _hide_loading(self) -> None:
+        if self._loading_item is not None:
+            self.canvas.itemconfigure(self._loading_item, state="hidden")
+
+    def _position_loading_item(self) -> None:
+        if self._loading_item is None:
+            return
+        x = max(20, self.canvas.winfo_width() // 2)
+        y = max(20, self.canvas.winfo_height() // 2)
+        self.canvas.coords(self._loading_item, x, y)
+
+    def _on_canvas_configure(self, _event: tk.Event) -> None:
+        self._position_loading_item()
 
     def _fit_once_ready(self) -> None:
         if self.base_image is None:
@@ -213,11 +316,12 @@ class PreviewWindow(tk.Toplevel):
             return
         w = max(1, int(self.base_image.width * self.zoom))
         h = max(1, int(self.base_image.height * self.zoom))
-        render_key = (w, h, int(resample))
+        source_scale, source_image = self._choose_render_source(w, h)
+        render_key = (w, h, int(resample), source_image.width, source_image.height)
         if self._last_render_key == render_key and self.tk_image is not None:
             self.zoom_var.set(f"{int(self.zoom * 100)}%")
             return
-        resized = self.base_image.resize((w, h), resample)
+        resized = source_image.resize((w, h), resample)
         self.tk_image = ImageTk.PhotoImage(resized)
         if self._image_item is None:
             self._image_item = self.canvas.create_image(0, 0, anchor="nw")
@@ -310,6 +414,7 @@ class PreviewWindow(tk.Toplevel):
         self._set_zoom(target, interactive=True)
 
     def destroy(self) -> None:
+        self._load_token += 1
         if self._wheel_flush_after_id is not None:
             try:
                 self.after_cancel(self._wheel_flush_after_id)
@@ -347,12 +452,19 @@ class ImageMetadataViewer(tk.Tk):
         self.image_state: dict[str, dict[str, object]] = {}
         self.file_mtime_cache: dict[str, float] = {}
         self._cache_lock = threading.Lock()
+        self._thumb_prepare_lock = threading.Lock()
         self.current_image_path: Path | None = None
+        self.preview_window: PreviewWindow | None = None
         self.folders_panel_visible = True
         self.image_root_map: dict[str, Path] = {}
         self._scan_roots_snapshot: list[Path] = []
         self._scan_token = 0
         self._update_check_in_progress = False
+        self._filter_token = 0
+        self._filter_worker_thread: threading.Thread | None = None
+        self._thumb_decode_token = 0
+        self._thumb_decode_thread: threading.Thread | None = None
+        self._thumb_prepared_images: dict[int, tuple[tuple[str, int, int, int], Image.Image]] = {}
 
         self.thumb_size_var = tk.DoubleVar(value=float(DEFAULT_THUMB_SIZE))
         self.columns_var = tk.StringVar(value=str(DEFAULT_COLUMNS))
@@ -1254,6 +1366,7 @@ class ImageMetadataViewer(tk.Tk):
             self.image_state = {}
 
     def _save_state(self) -> None:
+        self._prune_image_state()
         payload = {
             "selected_dirs": [str(p) for p in self.selected_dirs],
             "ui": {
@@ -1278,11 +1391,23 @@ class ImageMetadataViewer(tk.Tk):
         self._save_state_after_id = None
         self._save_state()
 
-    def _get_image_state(self, path: Path) -> dict[str, object]:
+    def _get_image_state(self, path: Path, create: bool = False) -> dict[str, object]:
         key = str(path)
-        if key not in self.image_state:
+        if create and key not in self.image_state:
             self.image_state[key] = {"favorite": False, "tags": []}
-        return self.image_state[key]
+        return self.image_state.get(key, {})
+
+    def _prune_image_state(self, existing_keys: set[str] | None = None) -> None:
+        pruned: dict[str, dict[str, object]] = {}
+        for path_key, state in self.image_state.items():
+            if existing_keys is not None and path_key not in existing_keys:
+                continue
+            favorite = bool(state.get("favorite", False))
+            tags = self._normalize_tags(state.get("tags", []))
+            if not favorite and not tags:
+                continue
+            pruned[path_key] = {"favorite": favorite, "tags": tags}
+        self.image_state = pruned
 
     @staticmethod
     def _normalize_tags(tags_raw: object) -> list[str]:
@@ -1447,6 +1572,7 @@ class ImageMetadataViewer(tk.Tk):
     def apply_filters(self) -> None:
         self._filter_after_id = None
         if not self.all_image_paths:
+            self._filter_token += 1
             self._render_thumbnails([])
             return
 
@@ -1454,11 +1580,32 @@ class ImageMetadataViewer(tk.Tk):
         tag_filter = self.tag_filter_var.get().strip().lower()
         favorites_only = self.favorites_only_var.get()
         sort_mode = self.sort_var.get()
+        self._filter_token += 1
+        token = self._filter_token
         if query or tag_filter:
             self._cancel_metadata_warmup()
+            self._set_status("Filtering images...", "busy")
 
+        self._filter_worker_thread = threading.Thread(
+            target=self._filter_worker,
+            args=(token, list(self.all_image_paths), query, tag_filter, favorites_only, sort_mode),
+            daemon=True,
+        )
+        self._filter_worker_thread.start()
+
+    def _filter_worker(
+        self,
+        token: int,
+        paths: list[Path],
+        query: str,
+        tag_filter: str,
+        favorites_only: bool,
+        sort_mode: str,
+    ) -> None:
         filtered: list[Path] = []
-        for path in self.all_image_paths:
+        for path in paths:
+            if token != self._filter_token:
+                return
             state = self._get_image_state(path)
             favorite = bool(state.get("favorite", False))
 
@@ -1475,6 +1622,11 @@ class ImageMetadataViewer(tk.Tk):
 
         reverse = sort_mode != "Oldest"
         filtered.sort(key=self._sort_mtime_cached, reverse=reverse)
+        self.after(0, lambda: self._on_filters_ready(token, filtered))
+
+    def _on_filters_ready(self, token: int, filtered: list[Path]) -> None:
+        if token != self._filter_token:
+            return
         self._render_thumbnails(filtered)
 
     def scan_images(self) -> None:
@@ -1552,6 +1704,7 @@ class ImageMetadataViewer(tk.Tk):
                 self.image_root_map[str(path)] = root
         # Keep cache entries only for existing files.
         existing = {str(p) for p in found}
+        self._prune_image_state()
         self.file_mtime_cache = {key: float(value) for key, value in mtime_by_key.items() if key in existing}
         with self._cache_lock:
             self.metadata_cache = {k: v for k, v in self.metadata_cache.items() if k in existing}
@@ -1668,7 +1821,16 @@ class ImageMetadataViewer(tk.Tk):
         self._thumb_cell_gap_x = 3
         self._thumb_cell_gap_y = 3
         self._thumb_render_index = 0
+        self._thumb_decode_token = token
+        with self._thumb_prepare_lock:
+            self._thumb_prepared_images = {}
         self._render_skeleton_grid(len(self.image_paths))
+        self._thumb_decode_thread = threading.Thread(
+            target=self._decode_thumbnail_worker,
+            args=(token, list(self.image_paths), self._thumb_render_size),
+            daemon=True,
+        )
+        self._thumb_decode_thread.start()
         self._set_status(f"Rendering thumbnails: 0 / {len(self.image_paths)} ...", "busy")
         self._render_thumbnail_batch(token)
 
@@ -1685,9 +1847,18 @@ class ImageMetadataViewer(tk.Tk):
                 break
             idx = self._thumb_render_index
             path = self.image_paths[idx]
+            cache_key = self._thumbnail_cache_key(path, size)
+            thumb_img = self._get_cached_thumbnail(cache_key)
+            if thumb_img is None:
+                prepared = self._pop_prepared_thumbnail(idx)
+                if prepared is None:
+                    break
+                prepared_key, prepared_image = prepared
+                thumb_img = ImageTk.PhotoImage(prepared_image)
+                self._store_thumbnail(prepared_key, thumb_img)
             row = idx // columns
             col = idx % columns
-            self._create_thumbnail_cell(path, idx, row, col, size)
+            self._create_thumbnail_cell(path, idx, row, col, size, thumb_img)
             self._thumb_render_index += 1
 
         self._thumb_batch_counter += 1
@@ -1699,7 +1870,8 @@ class ImageMetadataViewer(tk.Tk):
         )
 
         if self._thumb_render_index < total_count:
-            self._thumb_batch_after_id = self.after(1, lambda: self._render_thumbnail_batch(token))
+            delay = 1 if self._thumb_render_index > 0 else 12
+            self._thumb_batch_after_id = self.after(delay, lambda: self._render_thumbnail_batch(token))
             return
 
         self._thumb_batch_after_id = None
@@ -1734,7 +1906,15 @@ class ImageMetadataViewer(tk.Tk):
 
         self._refresh_thumb_cell_highlight()
 
-    def _create_thumbnail_cell(self, path: Path, idx: int, row: int, col: int, size: int) -> None:
+    def _create_thumbnail_cell(
+        self,
+        path: Path,
+        idx: int,
+        row: int,
+        col: int,
+        size: int,
+        thumb_img: ImageTk.PhotoImage,
+    ) -> None:
         self.canvas.delete(f"skel_idx_{idx}")
         x0 = col * (self._thumb_cell_width + self._thumb_cell_gap_x)
         y0 = row * (self._thumb_cell_height + self._thumb_cell_gap_y)
@@ -1772,7 +1952,6 @@ class ImageMetadataViewer(tk.Tk):
         self.thumb_cells_by_path[str(path)] = shell
         self.thumb_inner_by_path[str(path)] = cell
 
-        thumb_img = self._load_thumbnail(path, size)
         img_x = (ix0 + ix1) / 2
         img_y = iy0 + pad + (size / 2)
         image_item = self.canvas.create_image(img_x, img_y, image=thumb_img, anchor="center", tags=tags)
@@ -1953,14 +2132,25 @@ class ImageMetadataViewer(tk.Tk):
         view_h = max(1, self.canvas.winfo_height())
         self.canvas.configure(scrollregion=(0, 0, max(total_w, view_w), max(total_h, view_h)))
 
-    def _load_thumbnail(self, path: Path, size: int) -> ImageTk.PhotoImage:
+    def _thumbnail_cache_key(self, path: Path, size: int) -> tuple[str, int, int, int]:
         sig_mtime, sig_size = self._file_signature(path)
-        cache_key = (str(path), size, sig_mtime, sig_size)
-        cached = self.thumbnail_cache.get(cache_key)
-        if cached is not None:
-            self.thumbnail_cache.move_to_end(cache_key)
+        return str(path), size, sig_mtime, sig_size
+
+    def _get_cached_thumbnail(self, cache_key: tuple[str, int, int, int]) -> ImageTk.PhotoImage | None:
+        with self._cache_lock:
+            cached = self.thumbnail_cache.get(cache_key)
+            if cached is not None:
+                self.thumbnail_cache.move_to_end(cache_key)
             return cached
 
+    def _store_thumbnail(self, cache_key: tuple[str, int, int, int], image: ImageTk.PhotoImage) -> None:
+        with self._cache_lock:
+            self.thumbnail_cache[cache_key] = image
+            self.thumbnail_cache.move_to_end(cache_key)
+            while len(self.thumbnail_cache) > THUMB_CACHE_MAX:
+                self.thumbnail_cache.popitem(last=False)
+
+    def _prepare_thumbnail_image(self, path: Path, size: int) -> Image.Image:
         target = (size, size)
         try:
             with Image.open(path) as im:
@@ -1970,16 +2160,27 @@ class ImageMetadataViewer(tk.Tk):
                 x = (target[0] - thumb.width) // 2
                 y = (target[1] - thumb.height) // 2
                 bg.paste(thumb.convert("RGB"), (x, y))
-                result = ImageTk.PhotoImage(bg)
+                return bg
         except Exception:
-            fallback = Image.new("RGB", target, (80, 40, 40))
-            result = ImageTk.PhotoImage(fallback)
+            return Image.new("RGB", target, (80, 40, 40))
 
-        self.thumbnail_cache[cache_key] = result
-        self.thumbnail_cache.move_to_end(cache_key)
-        while len(self.thumbnail_cache) > THUMB_CACHE_MAX:
-            self.thumbnail_cache.popitem(last=False)
-        return result
+    def _decode_thumbnail_worker(self, token: int, paths: list[Path], size: int) -> None:
+        for idx, path in enumerate(paths):
+            if token != self._thumb_decode_token or token != self._thumb_render_token:
+                return
+            cache_key = self._thumbnail_cache_key(path, size)
+            if self._get_cached_thumbnail(cache_key) is not None:
+                continue
+            prepared = self._prepare_thumbnail_image(path, size)
+            with self._thumb_prepare_lock:
+                self._thumb_prepared_images[idx] = (cache_key, prepared)
+
+    def _pop_prepared_thumbnail(
+        self,
+        idx: int,
+    ) -> tuple[tuple[str, int, int, int], Image.Image] | None:
+        with self._thumb_prepare_lock:
+            return self._thumb_prepared_images.pop(idx, None)
 
     def on_thumbnail_click(self, index: int) -> None:
         if index < 0 or index >= len(self.image_paths):
@@ -1996,7 +2197,13 @@ class ImageMetadataViewer(tk.Tk):
         if index < 0 or index >= len(self.image_paths):
             return
         path = self.image_paths[index]
-        PreviewWindow(self, path)
+        if self.preview_window is None or not self.preview_window.winfo_exists():
+            self.preview_window = PreviewWindow(self, path)
+            return
+        self.preview_window.load_path(path)
+        self.preview_window.deiconify()
+        self.preview_window.lift()
+        self.preview_window.focus_force()
 
     def _on_thumb_hover(self, path: Path, entering: bool) -> None:
         key = str(path)
@@ -2130,8 +2337,9 @@ class ImageMetadataViewer(tk.Tk):
         if not self.current_image_path:
             messagebox.showinfo("No image selected", "Select an image first.")
             return
-        state = self._get_image_state(self.current_image_path)
+        state = self._get_image_state(self.current_image_path, create=True)
         state["favorite"] = not bool(state.get("favorite", False))
+        self._prune_image_state()
         self._schedule_save_state()
         self._sync_current_controls(self.current_image_path, self._get_metadata_cached(self.current_image_path))
         self.apply_filters()
@@ -2143,8 +2351,9 @@ class ImageMetadataViewer(tk.Tk):
         raw = self.current_tags_var.get()
         tags = [part.strip() for part in raw.split(",") if part.strip()]
         unique = sorted(set(tags), key=lambda s: s.lower())
-        state = self._get_image_state(self.current_image_path)
+        state = self._get_image_state(self.current_image_path, create=True)
         state["tags"] = unique
+        self._prune_image_state()
         self._invalidate_search_index(self.current_image_path)
         self._schedule_save_state()
         self._set_status(f"Saved tags: {', '.join(unique) if unique else 'None'}", "ok")
@@ -2778,7 +2987,7 @@ class ImageMetadataViewer(tk.Tk):
 
         prompt = self._pick(metadata, ["Prompt"]) or "-"
         negative_prompt = self._pick(metadata, ["Negative prompt"]) or "-"
-        loras = self._extract_loras(prompt, metadata)
+        loras = self._pick(metadata, ["LoRAs"]) or self._extract_loras(prompt, metadata)
 
         title = f"{favorite_mark} {path.name}"
         return (
@@ -3172,6 +3381,8 @@ class ImageMetadataViewer(tk.Tk):
 
     def _on_close(self) -> None:
         self._scan_token += 1
+        self._filter_token += 1
+        self._thumb_decode_token += 1
         self._cancel_metadata_warmup()
         if self._thumb_render_after_id is not None:
             self.after_cancel(self._thumb_render_after_id)
@@ -3216,6 +3427,9 @@ class ImageMetadataViewer(tk.Tk):
             self._folder_tip_win.destroy()
             self._folder_tip_win = None
             self._folder_tip_label = None
+        if self.preview_window is not None and self.preview_window.winfo_exists():
+            self.preview_window.destroy()
+            self.preview_window = None
         self._save_state()
         self.destroy()
 
