@@ -19,7 +19,7 @@ py -m PyInstaller `
   --noconfirm `
   --clean `
   --windowed `
-  --name 'LocalImageMetadataCatalog' `
+  --name 'PromptLens' `
   $modeArgs `
   app.py
 
@@ -29,5 +29,5 @@ Write-Host 'Output folder:'
 if ($OneFile) {
     Write-Host "  $PSScriptRoot\\dist"
 } else {
-    Write-Host "  $PSScriptRoot\\dist\\LocalImageMetadataCatalog"
+    Write-Host "  $PSScriptRoot\\dist\\PromptLens"
 }

@@ -1,38 +1,25 @@
-# PromptLens
+﻿# PromptLens
 
-Local desktop app (Tkinter) for browsing generated images and reading generation metadata.
+Local Windows desktop app (Tkinter) for browsing generated images, reviewing generations, and reading embedded metadata.
 
 <img width="3839" height="2044" alt="image" src="https://github.com/user-attachments/assets/1d786320-9745-4ec4-9572-446558b30597" />
 
-## Useful
+PromptLens is built for image-generation workflows where files already contain useful metadata. It scans one or more folders, builds a fast thumbnail catalog, shows generation details in a structured inspector, and adds a lightweight review pass for favorites, rejects, and custom tags.
 
-You need to place the .exe file in a new folder. When you exit the application, a file with your settings is created or updated (if one already exists)—including selected folders, columns, and thumbnail sizes.
-
-## Highlights
-- Multi-folder scan (recursive)
-- Fast thumbnail catalog with adjustable:
-  - thumb size
-  - columns
-- Full preview on double-click with zoom controls
-- Structured metadata panel:
-  - Prompt / Negative prompt
-  - Model / Sampler / Scheduler
-  - Seed / CFG / Steps
-  - Resolution / file size
-  - LoRAs
-- Favorites + custom tags
-- Search/filter/sort:
-  - global search (filename + key metadata fields)
-  - prompt tag filter
-  - favorites-only
-  - `Newest` / `Oldest`
-- Subfolder markers:
-  - colored dot per subfolder group
-  - tooltip with folder path
+## Features
+- Recursive multi-folder scan
+- Support for `png`, `jpg`, `jpeg`, `webp`, `bmp`, `tif`, `tiff`
+- Adjustable thumbnail size and grid columns
+- Search, prompt-tag filter, favorites-only filter, review filter, and newest/oldest sorting
+- Inspector with prompt, negative prompt, model, sampler, scheduler, seed, CFG, steps, resolution, file size, and LoRAs when available
+- Full preview on double-click, plus inline preview in review mode
+- Review workflow with `Favorite`, `Reject`, `Reset`, and bulk delete of rejected images to Recycle Bin
+- Clipboard helpers for prompt text and inspector summary values
+- GitHub release check from the app menu
 
 ## Requirements
 - Windows
-- Python 3.10+ (tested with newer versions too)
+- Python 3.10+
 
 ## Quick Start
 ```powershell
@@ -40,49 +27,44 @@ py -m pip install -r requirements.txt
 py app.py
 ```
 
-## Build EXE (Windows)
-### Recommended (`onedir`)
+## Build EXE
+Recommended `onedir` build:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 ```
-Output:
-- `dist\LocalImageMetadataCatalog\LocalImageMetadataCatalog.exe`
+Output: `dist\PromptLens\PromptLens.exe`
 
-### Single-file (`onefile`)
+Single-file build:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build_exe.ps1 -OneFile
 ```
-Output:
-- `dist\LocalImageMetadataCatalog.exe`
+Output: `dist\PromptLens.exe`
 
 ## Controls
-- Catalog:
-  - mouse wheel: vertical scroll
-  - shift + wheel: horizontal scroll
-  - click thumbnail: select + metadata
-  - double-click thumbnail: full preview
-- Preview window:
-  - mouse wheel: zoom in/out
-  - `+` / `-`: zoom
-  - `Ctrl + 0`: 100%
-  - `F`: fit to window
+- Gallery: mouse wheel scroll, `Shift + wheel` for horizontal scroll, click to inspect, double-click to open full preview
+- Review mode: `V` toggle, `F` favorite, `R` reject, `U` reset
+- Preview window: mouse wheel zoom, `+` / `-`, `Ctrl + 0`, `F` fit
+- Inspector: copy positive prompt, save comma-separated tags, click summary chips to copy values
 
-## Data & State
-- App state file: `.image_catalog_state.json`
-- In script mode: stored next to `app.py`
-- In EXE mode: stored next to `.exe`
-- Stores:
-  - selected folders
-  - UI preferences
-  - favorites/tags
+## State
+PromptLens writes `.image_catalog_state.json` next to `app.py` in source mode or next to the `.exe` in packaged mode. The file is updated after closing the app and stores selected folders, UI preferences, and per-image review state.
 
-## Metadata Notes
-- Reads metadata from `PIL.Image.info` and EXIF.
-- Parses A1111-style `parameters`.
-- Parses ComfyUI JSON blocks (`prompt` / workflow metadata).
-- Field availability depends on generator/workflow.
+## Metadata
+- Reads metadata from `PIL.Image.info` and EXIF
+- Parses A1111-style `parameters`
+- Parses ComfyUI JSON blocks (`prompt` / workflow metadata)
+- Available fields depend on the generator and workflow
+
+## Updates
+`App -> Check for updates` checks the latest GitHub release. In EXE mode, if a newer `.exe` asset is available, PromptLens can download it and restart into the updated version.
+
+## Tests
+```powershell
+py -m unittest tests.test_app_helpers
+```
 
 ## Project Files
 - `app.py` - main application
-- `build_exe.ps1` - build helper script
-- `requirements.txt` - Python dependencies
+- `app_helpers.py` - metadata parsing, preview, state, filtering, review helpers
+- `build_exe.ps1` - PyInstaller build script
+- `PromptLens.spec` - PyInstaller spec file

@@ -1,0 +1,17 @@
+{
+  "selected_dirs": [
+    "E:/images"
+  ],
+  "ui": {
+    "columns": 4,
+    "thumb_size": 180
+  },
+  "images": {
+    "a.png": {
+      "favorite": true,
+      "tags": [
+        "tag"
+      ]
+    }
+  }
+}

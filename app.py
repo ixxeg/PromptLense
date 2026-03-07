@@ -19,6 +19,8 @@ from urllib import request as urlrequest
 
 from PIL import Image, ImageOps, ImageTk
 
+from app_helpers import CatalogHelper, ImageStateHelper, MetadataParser, PreviewMixin, ReviewHelper, StateStore, UiDispatchMixin
+
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 DEFAULT_THUMB_SIZE = 180
 DEFAULT_COLUMNS = 4
@@ -150,46 +152,24 @@ def enable_high_dpi() -> None:
             return
 
 
-class PreviewWindow(tk.Toplevel):
+class PreviewWindow(PreviewMixin, tk.Toplevel):
     def __init__(self, parent: tk.Tk, image_path: Path) -> None:
         super().__init__(parent)
         self.geometry("1200x820")
-
-        self.image_path = image_path
-        self.zoom = 1.0
-        self.min_zoom = 0.1
-        self.max_zoom = 8.0
-        self.base_image: Image.Image | None = None
-        self._image_pyramid: list[tuple[float, Image.Image]] = []
-        self.tk_image: ImageTk.PhotoImage | None = None
-        self._image_item: int | None = None
-        self._last_render_key: tuple[int, int, int, int, int] | None = None
-        self._pending_zoom: float | None = None
-        self._wheel_delta_accum = 0
-        self._wheel_flush_after_id: str | None = None
-        self._quality_after_id: str | None = None
-        self._load_token = 0
-        self._load_thread: threading.Thread | None = None
-        self.path_var = tk.StringVar(value=str(image_path))
-        self._loading_item: int | None = None
-
+        self._init_preview_state(image_path)
         self._build_ui()
         self.load_path(image_path)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
-
         toolbar = ttk.Frame(self, padding=(8, 6))
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(7, weight=1)
-
         ttk.Button(toolbar, text="-", width=3, command=self.zoom_out).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(toolbar, text="+", width=3, command=self.zoom_in).grid(row=0, column=1, padx=(0, 12))
         ttk.Button(toolbar, text="100%", command=self.reset_zoom).grid(row=0, column=2, padx=(0, 12))
         ttk.Button(toolbar, text="Fit", command=self.fit_to_window).grid(row=0, column=3, padx=(0, 12))
-
-        self.zoom_var = tk.StringVar(value="100%")
         ttk.Label(toolbar, textvariable=self.zoom_var).grid(row=0, column=4, padx=(0, 12))
         ttk.Label(toolbar, textvariable=self.path_var).grid(row=0, column=7, sticky="e")
 
@@ -197,25 +177,15 @@ class PreviewWindow(tk.Toplevel):
         content.grid(row=1, column=0, sticky="nsew")
         content.columnconfigure(0, weight=1)
         content.rowconfigure(0, weight=1)
-
         self.canvas = tk.Canvas(content, background="#101010", highlightthickness=0)
         self.v_scroll = ttk.Scrollbar(content, orient="vertical", command=self.canvas.yview)
         self.h_scroll = ttk.Scrollbar(content, orient="horizontal", command=self.canvas.xview)
         self.canvas.configure(yscrollcommand=self.v_scroll.set, xscrollcommand=self.h_scroll.set)
-
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
         self.h_scroll.grid(row=1, column=0, sticky="ew")
         self._image_item = self.canvas.create_image(0, 0, anchor="nw")
-        self._loading_item = self.canvas.create_text(
-            0,
-            0,
-            text="Loading preview...",
-            fill="#f2f2f2",
-            font=("Segoe UI Semibold", 12),
-            state="hidden",
-        )
-
+        self._loading_item = self.canvas.create_text(0, 0, text="Loading preview...", fill="#f2f2f2", font=("Segoe UI Semibold", 12), state="hidden")
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         self.canvas.bind("<Button-4>", self._on_mouse_wheel)
         self.canvas.bind("<Button-5>", self._on_mouse_wheel)
@@ -228,306 +198,51 @@ class PreviewWindow(tk.Toplevel):
         self.bind("<F>", lambda _e: self.fit_to_window())
         self.canvas.focus_set()
 
-    def load_path(self, image_path: Path) -> None:
-        self.image_path = image_path
+    def _on_preview_path_changed(self, image_path: Path) -> None:
         self.title(f"Preview: {image_path.name}")
-        self.path_var.set(str(image_path))
-        self.zoom = 1.0
-        self._pending_zoom = None
-        self._last_render_key = None
-        self._cancel_quality_render()
-        self._start_load_image()
 
-    def _start_load_image(self) -> None:
-        self._load_token += 1
-        token = self._load_token
-        self.base_image = None
-        self._image_pyramid = []
-        self.tk_image = None
-        if self._image_item is not None:
-            self.canvas.itemconfigure(self._image_item, image="")
-        self.canvas.configure(scrollregion=(0, 0, max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())))
-        self._show_loading("Loading preview...")
-        self._load_thread = threading.Thread(
-            target=self._load_image_worker,
-            args=(self.image_path, token),
-            daemon=True,
-        )
-        self._load_thread.start()
-
-    def _load_image_worker(self, image_path: Path, token: int) -> None:
-        try:
-            with Image.open(image_path) as im:
-                base_image = ImageOps.exif_transpose(im).convert("RGB")
-            pyramid = self._build_image_pyramid(base_image)
-            self.after(0, lambda: self._on_image_loaded(token, image_path, base_image, pyramid))
-        except Exception as exc:  # noqa: BLE001
-            self.after(0, lambda: self._on_image_load_failed(token, exc))
-
-    def _on_image_loaded(
-        self,
-        token: int,
-        image_path: Path,
-        base_image: Image.Image,
-        pyramid: list[tuple[float, Image.Image]],
-    ) -> None:
-        if token != self._load_token or image_path != self.image_path:
-            return
-        self.base_image = base_image
-        self._image_pyramid = pyramid
-        self._hide_loading()
-        self.after_idle(self._fit_once_ready)
-
-    def _on_image_load_failed(self, token: int, exc: Exception) -> None:
-        if token != self._load_token:
-            return
+    def _on_preview_load_failed(self, exc: Exception) -> None:
         self._hide_loading()
         messagebox.showerror("Preview error", f"Cannot open image:\n{exc}")
         self.destroy()
 
-    @staticmethod
-    def _build_image_pyramid(base_image: Image.Image) -> list[tuple[float, Image.Image]]:
-        pyramid: list[tuple[float, Image.Image]] = [(1.0, base_image)]
-        current = base_image
-        scale = 1.0
-        while min(current.width, current.height) > 512:
-            next_size = (max(1, current.width // 2), max(1, current.height // 2))
-            current = current.resize(next_size, Image.Resampling.BOX)
-            scale *= 0.5
-            pyramid.append((scale, current))
-        return pyramid
-
-    def _choose_render_source(self, target_w: int, target_h: int) -> tuple[float, Image.Image]:
-        if not self._image_pyramid:
-            return 1.0, self.base_image
-        source_scale, source_image = self._image_pyramid[0]
-        for scale, image in self._image_pyramid[1:]:
-            if image.width >= target_w and image.height >= target_h:
-                source_scale, source_image = scale, image
-                continue
-            break
-        return source_scale, source_image
-
-    def _show_loading(self, text: str) -> None:
-        if self._loading_item is None:
-            return
-        self.canvas.itemconfigure(self._loading_item, text=text, state="normal")
-        self._position_loading_item()
-
-    def _hide_loading(self) -> None:
-        if self._loading_item is not None:
-            self.canvas.itemconfigure(self._loading_item, state="hidden")
-
-    def _position_loading_item(self) -> None:
-        if self._loading_item is None:
-            return
-        x = max(20, self.canvas.winfo_width() // 2)
-        y = max(20, self.canvas.winfo_height() // 2)
-        self.canvas.coords(self._loading_item, x, y)
-
-    def _on_canvas_configure(self, _event: tk.Event) -> None:
-        self._position_loading_item()
-
-    def _fit_once_ready(self) -> None:
-        if self.base_image is None:
-            return
-        self.update_idletasks()
-        if self.canvas.winfo_width() <= 2 or self.canvas.winfo_height() <= 2:
-            self.after(30, self._fit_once_ready)
-            return
-        self.fit_to_window()
-
-    def _render(self, resample: int = Image.Resampling.LANCZOS) -> None:
-        if self.base_image is None:
-            return
-        w = max(1, int(self.base_image.width * self.zoom))
-        h = max(1, int(self.base_image.height * self.zoom))
-        source_scale, source_image = self._choose_render_source(w, h)
-        render_key = (w, h, int(resample), source_image.width, source_image.height)
-        if self._last_render_key == render_key and self.tk_image is not None:
-            self.zoom_var.set(f"{int(self.zoom * 100)}%")
-            return
-        resized = source_image.resize((w, h), resample)
-        self.tk_image = ImageTk.PhotoImage(resized)
-        if self._image_item is None:
-            self._image_item = self.canvas.create_image(0, 0, anchor="nw")
-        self.canvas.itemconfigure(self._image_item, image=self.tk_image)
-        self.canvas.configure(scrollregion=(0, 0, w, h))
-        self.zoom_var.set(f"{int(self.zoom * 100)}%")
-        self._last_render_key = render_key
-
-    def zoom_in(self) -> None:
-        self.set_zoom(self.zoom * 1.15)
-
-    def zoom_out(self) -> None:
-        self.set_zoom(self.zoom / 1.15)
-
-    def reset_zoom(self) -> None:
-        self.set_zoom(1.0)
-
-    def fit_to_window(self) -> None:
-        if self.base_image is None:
-            return
-        self.update_idletasks()
-        cw = max(1, self.canvas.winfo_width())
-        ch = max(1, self.canvas.winfo_height())
-        zx = cw / self.base_image.width
-        zy = ch / self.base_image.height
-        self.set_zoom(min(zx, zy))
-        self.canvas.xview_moveto(0)
-        self.canvas.yview_moveto(0)
-
-    def set_zoom(self, value: float) -> None:
-        self._set_zoom(value, interactive=False)
-
-    def _set_zoom(self, value: float, interactive: bool) -> None:
-        clamped = max(self.min_zoom, min(self.max_zoom, value))
-        self._pending_zoom = clamped
-        if abs(clamped - self.zoom) < 1e-9:
-            if self.tk_image is None:
-                self._render(Image.Resampling.LANCZOS)
-                return
-            if interactive:
-                self._schedule_quality_render()
-            return
-        self.zoom = clamped
-        if interactive:
-            self._render(Image.Resampling.BILINEAR)
-            self._schedule_quality_render()
-        else:
-            self._cancel_quality_render()
-            self._render(Image.Resampling.LANCZOS)
-
-    def _schedule_quality_render(self) -> None:
-        if self._quality_after_id is not None:
-            self.after_cancel(self._quality_after_id)
-        self._quality_after_id = self.after(130, self._render_quality)
-
-    def _cancel_quality_render(self) -> None:
-        if self._quality_after_id is not None:
-            self.after_cancel(self._quality_after_id)
-            self._quality_after_id = None
-
-    def _render_quality(self) -> None:
-        self._quality_after_id = None
-        self._render(Image.Resampling.LANCZOS)
-
-    @staticmethod
-    def _wheel_step(event: tk.Event) -> int:
-        delta = int(getattr(event, "delta", 0) or 0)
-        if delta:
-            return delta
-        num = int(getattr(event, "num", 0) or 0)
-        if num == 4:
-            return 120
-        if num == 5:
-            return -120
-        return 0
-
-    def _flush_wheel_zoom(self) -> None:
-        self._wheel_flush_after_id = None
-        delta = self._wheel_delta_accum
-        self._wheel_delta_accum = 0
-        if delta == 0:
-            return
-        ticks = int(delta / 120)
-        if ticks == 0:
-            ticks = 1 if delta > 0 else -1
-        base = self._pending_zoom if self._pending_zoom is not None else self.zoom
-        factor = 1.12 ** abs(ticks)
-        target = base * factor if ticks > 0 else base / factor
-        self._pending_zoom = target
-        self._set_zoom(target, interactive=True)
-
     def destroy(self) -> None:
-        self._load_token += 1
-        if self._wheel_flush_after_id is not None:
-            try:
-                self.after_cancel(self._wheel_flush_after_id)
-            except Exception:
-                pass
-            self._wheel_flush_after_id = None
-        self._cancel_quality_render()
+        self._destroy_preview_resources()
         super().destroy()
 
-    def _on_mouse_wheel(self, event: tk.Event) -> None:
-        # Mouse wheel always zooms in preview mode (coalesced for smoother interaction).
-        self._wheel_delta_accum += self._wheel_step(event)
-        if self._wheel_flush_after_id is None:
-            self._wheel_flush_after_id = self.after(24, self._flush_wheel_zoom)
 
-
-class InlinePreviewPane(tk.Frame):
+class InlinePreviewPane(PreviewMixin, tk.Frame):
     def __init__(self, parent: tk.Misc) -> None:
         super().__init__(parent, bg=PALETTE["surface_1"])
-        self.image_path: Path | None = None
-        self.zoom = 1.0
-        self.min_zoom = 0.1
-        self.max_zoom = 8.0
-        self.base_image: Image.Image | None = None
-        self._image_pyramid: list[tuple[float, Image.Image]] = []
-        self.tk_image: ImageTk.PhotoImage | None = None
-        self._image_item: int | None = None
-        self._last_render_key: tuple[int, int, int, int, int] | None = None
-        self._pending_zoom: float | None = None
-        self._wheel_delta_accum = 0
-        self._wheel_flush_after_id: str | None = None
-        self._quality_after_id: str | None = None
-        self._load_token = 0
-        self._load_thread: threading.Thread | None = None
-        self.path_var = tk.StringVar(value="")
-        self._loading_item: int | None = None
-        self.zoom_var = tk.StringVar(value="100%")
-
+        self._init_preview_state()
         self._build_ui()
         self.clear(PREVIEW_REVIEW_EMPTY_TEXT)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
-
         toolbar = tk.Frame(self, bg=PALETTE["surface_1"], padx=10, pady=10)
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(5, weight=1)
-
         ttk.Button(toolbar, text="-", width=3, command=self.zoom_out).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(toolbar, text="+", width=3, command=self.zoom_in).grid(row=0, column=1, padx=(0, 10))
         ttk.Button(toolbar, text="100%", command=self.reset_zoom).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(toolbar, text="Fit", command=self.fit_to_window).grid(row=0, column=3, padx=(0, 10))
         ttk.Label(toolbar, textvariable=self.zoom_var, style="Muted.TLabel").grid(row=0, column=4, sticky="w", padx=(0, 12))
-        path_label = tk.Label(
-            toolbar,
-            textvariable=self.path_var,
-            bg=PALETTE["surface_1"],
-            fg=PALETTE["muted"],
-            font=("Segoe UI", 9),
-            anchor="e",
-        )
-        path_label.grid(row=0, column=5, sticky="ew")
-
+        tk.Label(toolbar, textvariable=self.path_var, bg=PALETTE["surface_1"], fg=PALETTE["muted"], font=("Segoe UI", 9), anchor="e").grid(row=0, column=5, sticky="ew")
         content = tk.Frame(self, bg=PALETTE["surface_3"])
         content.grid(row=1, column=0, sticky="nsew")
         content.columnconfigure(0, weight=1)
         content.rowconfigure(0, weight=1)
-
         self.canvas = tk.Canvas(content, background="#101010", highlightthickness=0)
         self.v_scroll = ttk.Scrollbar(content, orient="vertical", command=self.canvas.yview)
         self.h_scroll = ttk.Scrollbar(content, orient="horizontal", command=self.canvas.xview)
         self.canvas.configure(yscrollcommand=self.v_scroll.set, xscrollcommand=self.h_scroll.set)
-
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
         self.h_scroll.grid(row=1, column=0, sticky="ew")
         self._image_item = self.canvas.create_image(0, 0, anchor="nw")
-        self._loading_item = self.canvas.create_text(
-            0,
-            0,
-            text="Loading preview...",
-            fill="#f2f2f2",
-            font=("Segoe UI Semibold", 12),
-            state="hidden",
-        )
-
+        self._loading_item = self.canvas.create_text(0, 0, text="Loading preview...", fill="#f2f2f2", font=("Segoe UI Semibold", 12), state="hidden")
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         self.canvas.bind("<Button-4>", self._on_mouse_wheel)
         self.canvas.bind("<Button-5>", self._on_mouse_wheel)
@@ -535,232 +250,16 @@ class InlinePreviewPane(tk.Frame):
         self.canvas.bind("<B1-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-    def clear(self, message: str = PREVIEW_EMPTY_TEXT) -> None:
-        self.image_path = None
-        self.base_image = None
-        self._image_pyramid = []
-        self.tk_image = None
-        self._last_render_key = None
-        self.path_var.set("")
-        self.zoom_var.set("100%")
-        if self._image_item is not None:
-            self.canvas.itemconfigure(self._image_item, image="")
-        self.canvas.configure(scrollregion=(0, 0, max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())))
-        self._show_loading(message)
-
-    def load_path(self, image_path: Path) -> None:
-        self.image_path = image_path
-        self.path_var.set(str(image_path))
-        self.zoom = 1.0
-        self._pending_zoom = None
-        self._last_render_key = None
-        self._cancel_quality_render()
-        self._start_load_image()
-
-    def _start_load_image(self) -> None:
-        if self.image_path is None:
-            return
-        self._load_token += 1
-        token = self._load_token
-        self.base_image = None
-        self._image_pyramid = []
-        self.tk_image = None
-        if self._image_item is not None:
-            self.canvas.itemconfigure(self._image_item, image="")
-        self.canvas.configure(scrollregion=(0, 0, max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())))
-        self._show_loading("Loading preview...")
-        self._load_thread = threading.Thread(
-            target=self._load_image_worker,
-            args=(self.image_path, token),
-            daemon=True,
-        )
-        self._load_thread.start()
-
-    def _load_image_worker(self, image_path: Path, token: int) -> None:
-        try:
-            with Image.open(image_path) as im:
-                base_image = ImageOps.exif_transpose(im).convert("RGB")
-            pyramid = PreviewWindow._build_image_pyramid(base_image)
-            self.after(0, lambda: self._on_image_loaded(token, image_path, base_image, pyramid))
-        except Exception as exc:  # noqa: BLE001
-            self.after(0, lambda: self._on_image_load_failed(token, exc))
-
-    def _on_image_loaded(
-        self,
-        token: int,
-        image_path: Path,
-        base_image: Image.Image,
-        pyramid: list[tuple[float, Image.Image]],
-    ) -> None:
-        if token != self._load_token or image_path != self.image_path:
-            return
-        self.base_image = base_image
-        self._image_pyramid = pyramid
-        self._hide_loading()
-        self.after_idle(self._fit_once_ready)
-
-    def _on_image_load_failed(self, token: int, exc: Exception) -> None:
-        if token != self._load_token:
-            return
-        self._show_loading(f"Cannot open preview.\n{exc}")
-
-    def _choose_render_source(self, target_w: int, target_h: int) -> tuple[float, Image.Image | None]:
-        if not self._image_pyramid:
-            return 1.0, self.base_image
-        source_scale, source_image = self._image_pyramid[0]
-        for scale, image in self._image_pyramid[1:]:
-            if image.width >= target_w and image.height >= target_h:
-                source_scale, source_image = scale, image
-                continue
-            break
-        return source_scale, source_image
-
-    def _show_loading(self, text: str) -> None:
-        if self._loading_item is None:
-            return
-        self.canvas.itemconfigure(self._loading_item, text=text, state="normal")
-        self._position_loading_item()
-
-    def _hide_loading(self) -> None:
-        if self._loading_item is not None:
-            self.canvas.itemconfigure(self._loading_item, state="hidden")
-
-    def _position_loading_item(self) -> None:
-        if self._loading_item is None:
-            return
-        x = max(20, self.canvas.winfo_width() // 2)
-        y = max(20, self.canvas.winfo_height() // 2)
-        self.canvas.coords(self._loading_item, x, y)
-
-    def _on_canvas_configure(self, _event: tk.Event) -> None:
-        self._position_loading_item()
-
-    def _fit_once_ready(self) -> None:
-        if self.base_image is None:
-            return
-        self.update_idletasks()
-        if self.canvas.winfo_width() <= 2 or self.canvas.winfo_height() <= 2:
-            self.after(30, self._fit_once_ready)
-            return
-        self.fit_to_window()
-
-    def _render(self, resample: int = Image.Resampling.LANCZOS) -> None:
-        if self.base_image is None:
-            return
-        w = max(1, int(self.base_image.width * self.zoom))
-        h = max(1, int(self.base_image.height * self.zoom))
-        _source_scale, source_image = self._choose_render_source(w, h)
-        if source_image is None:
-            return
-        render_key = (w, h, int(resample), source_image.width, source_image.height)
-        if self._last_render_key == render_key and self.tk_image is not None:
-            self.zoom_var.set(f"{int(self.zoom * 100)}%")
-            return
-        resized = source_image.resize((w, h), resample)
-        self.tk_image = ImageTk.PhotoImage(resized)
-        if self._image_item is None:
-            self._image_item = self.canvas.create_image(0, 0, anchor="nw")
-        self.canvas.itemconfigure(self._image_item, image=self.tk_image)
-        self.canvas.configure(scrollregion=(0, 0, w, h))
-        self.zoom_var.set(f"{int(self.zoom * 100)}%")
-        self._last_render_key = render_key
-
-    def zoom_in(self) -> None:
-        self.set_zoom(self.zoom * 1.15)
-
-    def zoom_out(self) -> None:
-        self.set_zoom(self.zoom / 1.15)
-
-    def reset_zoom(self) -> None:
-        self.set_zoom(1.0)
-
-    def fit_to_window(self) -> None:
-        if self.base_image is None:
-            return
-        self.update_idletasks()
-        cw = max(1, self.canvas.winfo_width())
-        ch = max(1, self.canvas.winfo_height())
-        zx = cw / self.base_image.width
-        zy = ch / self.base_image.height
-        self.set_zoom(min(zx, zy))
-        self.canvas.xview_moveto(0)
-        self.canvas.yview_moveto(0)
-
-    def set_zoom(self, value: float) -> None:
-        self._set_zoom(value, interactive=False)
-
-    def _set_zoom(self, value: float, interactive: bool) -> None:
-        clamped = max(self.min_zoom, min(self.max_zoom, value))
-        self._pending_zoom = clamped
-        if abs(clamped - self.zoom) < 1e-9:
-            if self.tk_image is None:
-                self._render(Image.Resampling.LANCZOS)
-                return
-            if interactive:
-                self._schedule_quality_render()
-            return
-        self.zoom = clamped
-        if interactive:
-            self._render(Image.Resampling.BILINEAR)
-            self._schedule_quality_render()
-        else:
-            self._cancel_quality_render()
-            self._render(Image.Resampling.LANCZOS)
-
-    def _schedule_quality_render(self) -> None:
-        if self._quality_after_id is not None:
-            self.after_cancel(self._quality_after_id)
-        self._quality_after_id = self.after(130, self._render_quality)
-
-    def _cancel_quality_render(self) -> None:
-        if self._quality_after_id is not None:
-            self.after_cancel(self._quality_after_id)
-            self._quality_after_id = None
-
-    def _render_quality(self) -> None:
-        self._quality_after_id = None
-        self._render(Image.Resampling.LANCZOS)
-
-    @staticmethod
-    def _wheel_step(event: tk.Event) -> int:
-        return PreviewWindow._wheel_step(event)
-
-    def _flush_wheel_zoom(self) -> None:
-        self._wheel_flush_after_id = None
-        delta = self._wheel_delta_accum
-        self._wheel_delta_accum = 0
-        if delta == 0:
-            return
-        ticks = int(delta / 120)
-        if ticks == 0:
-            ticks = 1 if delta > 0 else -1
-        base = self._pending_zoom if self._pending_zoom is not None else self.zoom
-        factor = 1.12 ** abs(ticks)
-        target = base * factor if ticks > 0 else base / factor
-        self._pending_zoom = target
-        self._set_zoom(target, interactive=True)
-
-    def _on_mouse_wheel(self, event: tk.Event) -> None:
-        self._wheel_delta_accum += self._wheel_step(event)
-        if self._wheel_flush_after_id is None:
-            self._wheel_flush_after_id = self.after(24, self._flush_wheel_zoom)
-
     def destroy(self) -> None:
-        self._load_token += 1
-        if self._wheel_flush_after_id is not None:
-            try:
-                self.after_cancel(self._wheel_flush_after_id)
-            except Exception:
-                pass
-            self._wheel_flush_after_id = None
-        self._cancel_quality_render()
+        self._destroy_preview_resources()
         super().destroy()
 
 
-class ImageMetadataViewer(tk.Tk):
+class ImageMetadataViewer(UiDispatchMixin, tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Local Image Metadata Catalog")
+        self._init_ui_dispatcher()
+        self.title("PromptLens")
         self.geometry("1400x820")
         self.configure(background=PALETTE["bg"])
         self.style = ttk.Style(self)
@@ -850,6 +349,8 @@ class ImageMetadataViewer(tk.Tk):
         self._delete_rejected_count = -1
         self._delete_rejected_visible = False
         self._delete_rejected_slot_width = 0
+        self._delete_rejected_in_progress = False
+        self._state_store = StateStore(STATE_FILE)
 
         self._load_state()
         self._thumb_last_applied_size = max(100, min(320, int(round(self.thumb_size_var.get()))))
@@ -1078,25 +579,23 @@ class ImageMetadataViewer(tk.Tk):
             if not latest:
                 raise RuntimeError("Could not detect latest version tag.")
             if not self._is_newer_version(latest, APP_VERSION):
-                self.after(0, lambda: self._on_update_check_finished("You already have the latest version.", "ok"))
+                self._post_to_ui(lambda: self._on_update_check_finished("You already have the latest version.", "ok"))
                 return
 
             asset_url, asset_name = self._choose_release_asset(assets)
             if not asset_url:
-                self.after(
-                    0,
+                self._post_to_ui(
                     lambda: self._on_update_check_no_asset(latest, html_url),
                 )
                 return
 
-            self.after(
-                0,
+            self._post_to_ui(
                 lambda: self._on_update_available(latest, asset_url, asset_name, html_url),
             )
         except (urlerror.URLError, TimeoutError) as exc:
-            self.after(0, lambda: self._on_update_check_finished(f"Update check failed: {exc}", "error"))
+            self._post_to_ui(lambda: self._on_update_check_finished(f"Update check failed: {exc}", "error"))
         except Exception as exc:  # noqa: BLE001
-            self.after(0, lambda: self._on_update_check_finished(f"Update check failed: {exc}", "error"))
+            self._post_to_ui(lambda: self._on_update_check_finished(f"Update check failed: {exc}", "error"))
 
     @staticmethod
     def _version_tuple(value: str) -> tuple[int, ...]:
@@ -1196,14 +695,20 @@ class ImageMetadataViewer(tk.Tk):
                     if not chunk:
                         break
                     out.write(chunk)
-            self.after(0, lambda: self._apply_downloaded_update(download_path))
+            self._post_to_ui(lambda: self._apply_downloaded_update(download_path))
         except Exception as exc:  # noqa: BLE001
             try:
                 if download_path.exists():
                     download_path.unlink()
             except Exception:
                 pass
-            self.after(0, lambda: self._on_update_check_finished(f"Download failed: {exc}", "error"))
+            self._post_to_ui(lambda: self._on_update_check_finished(f"Download failed: {exc}", "error"))
+
+    @staticmethod
+    def _escape_cmd_value(value: Path | str) -> str:
+        escaped = str(value).replace("^", "^^").replace("%", "%%").replace("&", "^&").replace("|", "^|")
+        escaped = escaped.replace("<", "^<").replace(">", "^>").replace("(", "^(").replace(")", "^)")
+        return escaped.replace("!", "^^!")
 
     def _apply_downloaded_update(self, downloaded_file: Path) -> None:
         self._update_check_in_progress = False
@@ -1227,8 +732,8 @@ class ImageMetadataViewer(tk.Tk):
         script_text = (
             "@echo off\r\n"
             "setlocal\r\n"
-            f"set TARGET={target_exe}\r\n"
-            f"set NEWFILE={new_exe}\r\n"
+            f"set \"TARGET={self._escape_cmd_value(target_exe)}\"\r\n"
+            f"set \"NEWFILE={self._escape_cmd_value(new_exe)}\"\r\n"
             ":retry\r\n"
             "move /Y \"%NEWFILE%\" \"%TARGET%\" >nul 2>nul\r\n"
             "if errorlevel 1 (\r\n"
@@ -1846,46 +1351,44 @@ class ImageMetadataViewer(tk.Tk):
             self.gallery_status.configure(fg=color if kind in {"warn", "error"} else PALETTE["muted"])
 
     def _load_state(self) -> None:
-        if not STATE_FILE.exists():
+        data, error = self._state_store.load()
+        if error:
+            self._set_status(error, "warn")
+        if not data:
             return
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return
+        dirs_raw = data.get("selected_dirs", [])
+        if isinstance(dirs_raw, list):
+            for item in dirs_raw:
+                p = Path(str(item))
+                if p.exists() and p.is_dir() and p not in self.selected_dirs:
+                    self.selected_dirs.append(p)
 
-            dirs_raw = data.get("selected_dirs", [])
-            if isinstance(dirs_raw, list):
-                for item in dirs_raw:
-                    p = Path(str(item))
-                    if p.exists() and p.is_dir() and p not in self.selected_dirs:
-                        self.selected_dirs.append(p)
+        ui = data.get("ui", {})
+        if isinstance(ui, dict):
+            columns = str(ui.get("columns", DEFAULT_COLUMNS))
+            thumb_size = ui.get("thumb_size", DEFAULT_THUMB_SIZE)
+            sort_mode = str(ui.get("sort", "Newest"))
+            review_mode = str(ui.get("review_filter", "All"))
+            panel_visible = ui.get("folders_panel_visible", True)
+            if columns.isdigit():
+                self.columns_var.set(str(max(2, min(12, int(columns)))))
+            if isinstance(thumb_size, int):
+                self.thumb_size_var.set(float(max(100, min(320, thumb_size))))
+            if sort_mode in {"Newest", "Oldest"}:
+                self.sort_var.set(sort_mode)
+            if review_mode in REVIEW_STATUSES:
+                self.review_filter_var.set(review_mode)
+            if isinstance(panel_visible, bool):
+                self.folders_panel_visible = panel_visible
 
-            ui = data.get("ui", {})
-            if isinstance(ui, dict):
-                columns = str(ui.get("columns", DEFAULT_COLUMNS))
-                thumb_size = ui.get("thumb_size", DEFAULT_THUMB_SIZE)
-                sort_mode = str(ui.get("sort", "Newest"))
-                review_mode = str(ui.get("review_filter", "All"))
-                panel_visible = ui.get("folders_panel_visible", True)
-                if columns.isdigit():
-                    self.columns_var.set(str(max(2, min(12, int(columns)))))
-                if isinstance(thumb_size, int):
-                    self.thumb_size_var.set(float(max(100, min(320, thumb_size))))
-                if sort_mode in {"Newest", "Oldest"}:
-                    self.sort_var.set(sort_mode)
-                if review_mode in REVIEW_STATUSES:
-                    self.review_filter_var.set(review_mode)
-                if isinstance(panel_visible, bool):
-                    self.folders_panel_visible = panel_visible
-
-            raw = data.get("images", {})
-            if isinstance(raw, dict):
-                for path_str, item in raw.items():
-                    state_item = self._deserialize_image_state_item(item)
-                    if state_item is not None:
-                        self.image_state[path_str] = state_item
-        except Exception:
-            self.image_state = {}
+        raw = data.get("images", {})
+        if isinstance(raw, dict):
+            loaded_state: dict[str, dict[str, object]] = {}
+            for path_str, item in raw.items():
+                state_item = self._deserialize_image_state_item(item)
+                if state_item is not None:
+                    loaded_state[path_str] = state_item
+            self.image_state = loaded_state
 
     def _deserialize_image_state_item(self, item: object) -> dict[str, object] | None:
         if not isinstance(item, dict):
@@ -1915,10 +1418,9 @@ class ImageMetadataViewer(tk.Tk):
             },
             "images": self.image_state,
         }
-        try:
-            STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        error = self._state_store.save(payload)
+        if error:
+            self._set_status(error, "warn")
 
     def _schedule_save_state(self) -> None:
         if self._save_state_after_id is not None:
@@ -1936,27 +1438,11 @@ class ImageMetadataViewer(tk.Tk):
         return self.image_state.get(key, {})
 
     def _prune_image_state(self, existing_keys: set[str] | None = None) -> None:
-        pruned: dict[str, dict[str, object]] = {}
-        for path_key, state in self.image_state.items():
-            if existing_keys is not None and path_key not in existing_keys:
-                continue
-            favorite = bool(state.get("favorite", False))
-            tags = self._normalize_tags(state.get("tags", []))
-            review_status = str(state.get("review_status", "")).strip().lower()
-            if not favorite and not tags and review_status != "reject":
-                continue
-            item: dict[str, object] = {"favorite": favorite, "tags": tags}
-            if review_status == "reject":
-                item["review_status"] = review_status
-            pruned[path_key] = item
-        self.image_state = pruned
+        self.image_state = ImageStateHelper.prune_image_state(self.image_state, existing_keys)
 
     @staticmethod
     def _normalized_review_status(value: object) -> str:
-        status = str(value or "").strip().lower()
-        if status == "reject":
-            return status
-        return "unreviewed"
+        return ImageStateHelper.normalized_review_status(value)
 
     def _get_review_status(self, path: Path | None) -> str:
         if path is None:
@@ -1965,17 +1451,11 @@ class ImageMetadataViewer(tk.Tk):
 
     @staticmethod
     def _normalize_tags(tags_raw: object) -> list[str]:
-        if not isinstance(tags_raw, list):
-            return []
-        return sorted({str(tag).strip().lower() for tag in tags_raw if str(tag).strip()})
+        return ImageStateHelper.normalize_tags(tags_raw)
 
     @staticmethod
     def _metadata_signature(path: Path) -> tuple[int, int, int]:
-        try:
-            stat = path.stat()
-            return int(stat.st_mtime_ns), int(stat.st_size), METADATA_PARSE_REV
-        except Exception:
-            return -1, -1, METADATA_PARSE_REV
+        return CatalogHelper.metadata_signature(path, METADATA_PARSE_REV)
 
     def _get_search_index_record(self, path: Path) -> tuple[str, str]:
         key = str(path)
@@ -1991,15 +1471,7 @@ class ImageMetadataViewer(tk.Tk):
                 return cached[1], cached[2]
 
         metadata = self._get_metadata_cached(path)
-        prompt_text = str(metadata.get("Prompt", "")).strip().lower()
-        haystack_parts = [path.name.lower()]
-        if tags:
-            haystack_parts.append(" ".join(tags))
-        for field in ("Prompt", "Negative prompt", "Model", "Sampler", "Scheduler", "Seed", "CFG", "Steps", "Resolution", "LoRAs"):
-            value = str(metadata.get(field, "")).strip().lower()
-            if value:
-                haystack_parts.append(value)
-        search_text = " | ".join(haystack_parts)
+        prompt_text, search_text = CatalogHelper.build_search_record(path, metadata, tags)
 
         with self._cache_lock:
             self.search_index_cache[key] = (sig, prompt_text, search_text)
@@ -2043,15 +1515,7 @@ class ImageMetadataViewer(tk.Tk):
 
     @staticmethod
     def _best_root_for_path(path: Path, roots: list[Path]) -> Path | None:
-        best: Path | None = None
-        for root in roots:
-            try:
-                path.relative_to(root)
-            except Exception:
-                continue
-            if best is None or len(root.parts) > len(best.parts):
-                best = root
-        return best
+        return CatalogHelper.best_root_for_path(path, roots)
 
     def _subfolder_hint(self, path: Path) -> tuple[str | None, str | None]:
         key = str(path)
@@ -2167,32 +1631,22 @@ class ImageMetadataViewer(tk.Tk):
         sort_mode: str,
         preserve_view: bool,
     ) -> None:
-        filtered: list[Path] = []
-        for path in paths:
-            if token != self._filter_token:
-                return
-            state = self._get_image_state(path)
-            favorite = bool(state.get("favorite", False))
-            review_status = self._get_review_status(path)
-
-            if favorites_only and not favorite:
-                continue
-            if review_filter == "Unreviewed" and review_status != "unreviewed":
-                continue
-            if review_filter == "Reject" and review_status != "reject":
-                continue
-            if tag_filter or query:
-                prompt_text, search_text = self._get_search_index_record(path)
-                if tag_filter and tag_filter not in prompt_text:
-                    continue
-                if query and query not in search_text:
-                    continue
-
-            filtered.append(path)
-
-        reverse = sort_mode != "Oldest"
-        filtered.sort(key=self._sort_mtime_cached, reverse=reverse)
-        self.after(0, lambda: self._on_filters_ready(token, filtered, preserve_view))
+        filtered, cancelled = CatalogHelper.filter_paths(
+            paths,
+            query=query,
+            tag_filter=tag_filter,
+            favorites_only=favorites_only,
+            review_filter=review_filter,
+            sort_mode=sort_mode,
+            get_state=self._get_image_state,
+            get_review_status=self._get_review_status,
+            get_search_record=self._get_search_index_record,
+            sort_key=self._sort_mtime_cached,
+            should_cancel=lambda: token != self._filter_token,
+        )
+        if cancelled:
+            return
+        self._post_to_ui(lambda: self._on_filters_ready(token, filtered, preserve_view))
 
     def _on_filters_ready(self, token: int, filtered: list[Path], preserve_view: bool) -> None:
         if token != self._filter_token:
@@ -2214,48 +1668,18 @@ class ImageMetadataViewer(tk.Tk):
     def _scan_worker(self, token: int) -> None:
         try:
             roots = list(self._scan_roots_snapshot or self.selected_dirs)
-            found_by_key: dict[str, Path] = {}
-            root_by_key: dict[str, Path] = {}
-            mtime_by_key: dict[str, float] = {}
-            for root in roots:
-                if token != self._scan_token:
-                    return
-                for file_path in root.rglob("*"):
-                    if token != self._scan_token:
-                        return
-                    try:
-                        if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                            continue
-                    except Exception:
-                        continue
-                    mtime: float | None = None
-                    try:
-                        mtime = float(file_path.stat().st_mtime)
-                    except Exception:
-                        pass
-                    try:
-                        canonical = file_path.resolve()
-                    except Exception:
-                        canonical = file_path
-                    key = str(canonical)
-                    if key not in found_by_key:
-                        found_by_key[key] = canonical
-                        if mtime is not None:
-                            mtime_by_key[key] = mtime
-                    elif mtime is not None and mtime > mtime_by_key.get(key, 0.0):
-                        mtime_by_key[key] = mtime
-                    prev_root = root_by_key.get(key)
-                    if prev_root is None or len(root.parts) > len(prev_root.parts):
-                        root_by_key[key] = root
-            found_keys = sorted(found_by_key.keys(), key=lambda k: mtime_by_key.get(k, 0.0), reverse=True)
-            found = [found_by_key[key] for key in found_keys]
-            if token != self._scan_token:
+            found, root_by_key, mtime_by_key, cancelled = CatalogHelper.scan_image_roots(
+                roots,
+                SUPPORTED_EXTENSIONS,
+                should_cancel=lambda: token != self._scan_token,
+            )
+            if cancelled or token != self._scan_token:
                 return
-            self.after(0, lambda: self._on_scan_complete(token, found, root_by_key, mtime_by_key))
+            self._post_to_ui(lambda: self._on_scan_complete(token, found, root_by_key, mtime_by_key))
         except Exception as exc:  # noqa: BLE001
             if token != self._scan_token:
                 return
-            self.after(0, lambda: self._set_status(f"Scan error: {exc}", "error"))
+            self._post_to_ui(lambda: self._set_status(f"Scan error: {exc}", "error"))
 
     def _on_scan_complete(
         self,
@@ -2277,11 +1701,17 @@ class ImageMetadataViewer(tk.Tk):
         self._prune_image_state()
         self.file_mtime_cache = {key: float(value) for key, value in mtime_by_key.items() if key in existing}
         with self._cache_lock:
-            self.metadata_cache = {k: v for k, v in self.metadata_cache.items() if k in existing}
-            self.metadata_cache_sig = {k: v for k, v in self.metadata_cache_sig.items() if k in existing}
-            self.search_index_cache = {k: v for k, v in self.search_index_cache.items() if k in existing}
-            self.thumbnail_cache = OrderedDict(
-                (k, v) for k, v in self.thumbnail_cache.items() if k[0] in existing
+            (
+                self.metadata_cache,
+                self.metadata_cache_sig,
+                self.search_index_cache,
+                self.thumbnail_cache,
+            ) = CatalogHelper.prune_runtime_caches(
+                existing,
+                self.metadata_cache,
+                self.metadata_cache_sig,
+                self.search_index_cache,
+                self.thumbnail_cache,
             )
         self.apply_filters()
         self._start_metadata_warmup(found)
@@ -2802,10 +2232,7 @@ class ImageMetadataViewer(tk.Tk):
             self._apply_thumb_visual_state(Path(key), hovering=(key == self._hover_path_key))
 
     def _review_thumb_palette(self, review_status: str) -> tuple[str, str]:
-        normalized = self._normalized_review_status(review_status)
-        if normalized == "reject":
-            return "#feebef", "#eab6c0"
-        return PALETTE["thumb_bg"], PALETTE["border"]
+        return ReviewHelper.review_thumb_palette(review_status, PALETTE)
 
     def _apply_thumb_visual_state(self, path: Path, hovering: bool) -> None:
         key = str(path)
@@ -2953,10 +2380,7 @@ class ImageMetadataViewer(tk.Tk):
         )
 
     def _review_display(self, status: str) -> tuple[str, str, str]:
-        normalized = self._normalized_review_status(status)
-        if normalized == "reject":
-            return "Reject", "#fdebec", "#b64b5f"
-        return "Unreviewed", PALETTE["chip_soft_bg"], PALETTE["chip_soft_fg"]
+        return ReviewHelper.review_display(status, PALETTE)
 
     def _apply_current_image_state_change(
         self,
@@ -3003,14 +2427,7 @@ class ImageMetadataViewer(tk.Tk):
         self.delete_rejected_slot.configure(width=target_width)
 
     def _next_review_focus_path(self, current_path: Path | None) -> Path | None:
-        if current_path is None or current_path not in self.image_paths:
-            return None
-        idx = self.image_paths.index(current_path)
-        if idx + 1 < len(self.image_paths):
-            return self.image_paths[idx + 1]
-        if idx - 1 >= 0:
-            return self.image_paths[idx - 1]
-        return None
+        return ReviewHelper.next_review_focus_path(current_path, self.image_paths)
 
     def _finalize_review_status(self, path: Path, status: str) -> None:
         state = self._get_image_state(path, create=True)
@@ -3046,25 +2463,12 @@ class ImageMetadataViewer(tk.Tk):
         return result == 0 and not bool(op.fAnyOperationsAborted)
 
     def _next_path_after_deletion(self, deleted_keys: set[str]) -> Path | None:
-        if not self.image_paths:
-            return None
-        current = self.current_image_path
-        if current is None:
-            for path in self.image_paths:
-                if str(path) not in deleted_keys:
-                    return path
-            return None
-        try:
-            idx = self.image_paths.index(current)
-        except ValueError:
-            idx = -1
-        candidates = self.image_paths[idx + 1 :] + self.image_paths[:idx] if idx >= 0 else list(self.image_paths)
-        for path in candidates:
-            if str(path) not in deleted_keys:
-                return path
-        return None
+        return ReviewHelper.next_path_after_deletion(self.image_paths, self.current_image_path, deleted_keys)
 
     def delete_rejected_images(self) -> None:
+        if self._delete_rejected_in_progress:
+            self._set_status("Delete rejected already in progress...", "info")
+            return
         rejected = self._rejected_paths()
         if not rejected:
             self._set_status("No rejected images to delete", "warn")
@@ -3078,7 +2482,16 @@ class ImageMetadataViewer(tk.Tk):
         )
         if not confirmed:
             return
+        self._delete_rejected_in_progress = True
+        self.delete_rejected_btn.configure(state="disabled")
+        self._set_status(f"Deleting {count} rejected image{'s' if count != 1 else ''}...", "busy")
+        threading.Thread(
+            target=self._delete_rejected_worker,
+            args=(list(rejected),),
+            daemon=True,
+        ).start()
 
+    def _delete_rejected_worker(self, rejected: list[Path]) -> None:
         deleted: list[Path] = []
         failed: list[Path] = []
         for path in rejected:
@@ -3086,7 +2499,12 @@ class ImageMetadataViewer(tk.Tk):
                 deleted.append(path)
             else:
                 failed.append(path)
+        self._post_to_ui(lambda: self._on_delete_rejected_complete(deleted, failed))
 
+    def _on_delete_rejected_complete(self, deleted: list[Path], failed: list[Path]) -> None:
+        self._delete_rejected_in_progress = False
+        if hasattr(self, "delete_rejected_btn") and self.delete_rejected_btn.winfo_exists():
+            self.delete_rejected_btn.configure(state="normal")
         if not deleted:
             messagebox.showerror("Delete failed", "Could not move rejected images to Recycle Bin.")
             self._set_status("Delete rejected failed", "error")
@@ -3257,556 +2675,51 @@ class ImageMetadataViewer(tk.Tk):
         return extracted
 
     def _extract_metadata(self, path: Path) -> dict[str, str]:
-        result: dict[str, str] = {}
-
-        try:
-            with Image.open(path) as im:
-                result["_width"] = str(im.width)
-                result["_height"] = str(im.height)
-
-                for key, value in (im.info or {}).items():
-                    if isinstance(value, bytes):
-                        value = value.decode("utf-8", errors="replace")
-                    result[str(key)] = str(value)
-
-                exif = im.getexif()
-                if exif:
-                    for tag_id, value in exif.items():
-                        result[f"EXIF_{tag_id}"] = str(value)
-        except Exception as exc:  # noqa: BLE001
-            result["_error"] = str(exc)
-
-        normalized = self._extract_generation_fields(result)
-        result.update(normalized)
-        return result
+        return MetadataParser.extract_metadata(path)
 
     def _extract_generation_fields(self, raw: dict[str, str]) -> dict[str, str]:
-        parsed: dict[str, str] = {}
-
-        for key in ("parameters", "Comment", "comment", "UserComment"):
-            if key not in raw:
-                continue
-            text = str(raw[key])
-            if "Negative prompt:" in text or "Steps:" in text:
-                prompt, neg, tail = self._parse_sd_parameters(text)
-                if prompt:
-                    parsed.setdefault("Prompt", prompt)
-                if neg:
-                    parsed.setdefault("Negative prompt", neg)
-                parsed.update({k: v for k, v in tail.items() if k not in parsed})
-
-        prompt_json = raw.get("prompt")
-        if prompt_json and str(prompt_json).lstrip().startswith("{"):
-            comfy = self._parse_comfy_prompt_json(str(prompt_json))
-            parsed.update({k: v for k, v in comfy.items() if v and k not in parsed})
-
-        # Some generators keep workflow/extra metadata in additional JSON blocks.
-        for key in ("workflow", "extra_pnginfo"):
-            block = raw.get(key)
-            if not block:
-                continue
-            text = str(block)
-            if text.lstrip().startswith("{"):
-                comfy2 = self._parse_comfy_prompt_json(text)
-                parsed.update({k: v for k, v in comfy2.items() if v and k not in parsed})
-            model_guess = self._guess_model_from_text(text)
-            if model_guess and "Model" not in parsed:
-                parsed["Model"] = model_guess
-
-        pick_map = {
-            "Model": [
-                "Model",
-                "model",
-                "model_name",
-                "sd_model_name",
-                "sd_model_hash",
-                "ckpt_name",
-                "unet_name",
-                "checkpoint",
-                "checkpoint_name",
-            ],
-            "Prompt": ["Prompt", "prompt_text", "prompt"],
-            "Negative prompt": ["Negative prompt", "negative_prompt", "negative"],
-            "Sampler": ["Sampler", "sampler", "sampler_name"],
-            "Scheduler": ["Scheduler", "scheduler", "Schedule type"],
-            "CFG": ["CFG", "CFG scale", "cfg", "cfg_scale"],
-            "Seed": ["Seed", "seed"],
-            "Steps": ["Steps", "steps"],
-            "Resolution": ["Resolution", "Size", "size"],
-        }
-
-        for target, keys in pick_map.items():
-            for key in keys:
-                if key in parsed and parsed[key]:
-                    value = str(parsed[key])
-                    if target == "Model":
-                        value = self._normalize_model_value(value)
-                        if not value:
-                            continue
-                    parsed[target] = value
-                    break
-                if key in raw and raw[key]:
-                    value = str(raw[key])
-                    if target == "Model":
-                        value = self._normalize_model_value(value)
-                        if not value:
-                            continue
-                    parsed[target] = value
-                    break
-
-        loras_found: set[str] = set()
-        excluded_assets: set[str] = set()
-
-        # 1) Prefer structured workflow parsing for Comfy/rgthree LoRA nodes.
-        for key in ("prompt", "workflow", "extra_pnginfo"):
-            value = raw.get(key)
-            if value:
-                value_text = str(value)
-                loras_found.update(self._extract_loras_from_workflow_json(value_text))
-                excluded_assets.update(self._extract_model_assets_from_workflow_json(value_text))
-                excluded_assets.update(self._extract_non_lora_assets_from_text(value_text))
-
-        # 2) Fallback to explicit LoRA-like textual fields only (avoid full workflow notes noise).
-        for key in (
-            "LoRAs",
-            "loras",
-            "lora",
-            "Lora hashes",
-            "parameters",
-            "Comment",
-            "comment",
-            "UserComment",
-        ):
-            value = raw.get(key)
-            if value:
-                value_text = str(value)
-                loras_found.update(self._extract_loras_from_text(value_text))
-                excluded_assets.update(self._extract_non_lora_assets_from_text(value_text))
-
-        # 3) Also parse already normalized positive prompt for <lora:...> entries.
-        prompt_norm = parsed.get("Prompt", "")
-        if prompt_norm:
-            loras_found.update(self._extract_loras_from_text(prompt_norm))
-            excluded_assets.update(self._extract_non_lora_assets_from_text(prompt_norm))
-
-        model_hint = self._clean_lora_name(parsed.get("Model", ""))
-        if model_hint:
-            excluded_assets.add(model_hint)
-
-        if loras_found:
-            canonical_excluded = {self._canonical_asset_name(item) for item in excluded_assets if item}
-            loras_found = {
-                item
-                for item in loras_found
-                if self._canonical_asset_name(item) not in canonical_excluded and not self._looks_like_non_lora_asset(item)
-            }
-            if loras_found:
-                parsed["LoRAs"] = ", ".join(sorted(loras_found, key=str.lower))
-
-        return parsed
+        return MetadataParser.extract_generation_fields(raw)
 
     def _parse_comfy_prompt_json(self, text: str) -> dict[str, str]:
-        out: dict[str, str] = {}
-
-        try:
-            data = json.loads(text)
-            if not isinstance(data, dict):
-                return out
-
-            # Comfy may wrap the actual prompt graph in nested objects.
-            if "prompt" in data and isinstance(data["prompt"], dict):
-                data = data["prompt"]
-
-            clip_texts: list[str] = []
-            loras: list[str] = []
-
-            for node in data.values():
-                if not isinstance(node, dict):
-                    continue
-                cls = str(node.get("class_type", ""))
-                inputs = node.get("inputs", {})
-                if not isinstance(inputs, dict):
-                    continue
-
-                if cls == "CLIPTextEncode" and isinstance(inputs.get("text"), str):
-                    clip_texts.append(inputs["text"].strip())
-
-                if "KSampler" in cls:
-                    out.setdefault("Sampler", str(inputs.get("sampler_name", "")))
-                    out.setdefault("Scheduler", str(inputs.get("scheduler", "")))
-                    out.setdefault("Seed", str(inputs.get("seed", "")))
-                    out.setdefault("CFG", str(inputs.get("cfg", "")))
-                    out.setdefault("Steps", str(inputs.get("steps", "")))
-
-                if "CheckpointLoader" in cls or "UNETLoader" in cls or "DiffusionModelLoader" in cls:
-                    for key in (
-                        "ckpt_name",
-                        "unet_name",
-                        "model_name",
-                        "checkpoint_name",
-                        "checkpoint",
-                        "model",
-                    ):
-                        value = self._normalize_model_value(str(inputs.get(key, "")).strip())
-                        if value:
-                            out.setdefault("Model", value)
-                            break
-
-                if "EmptyLatentImage" in cls:
-                    w = str(inputs.get("width", "")).strip()
-                    h = str(inputs.get("height", "")).strip()
-                    if w and h:
-                        out.setdefault("Resolution", f"{w}x{h}")
-
-                if "lora" in cls.lower():
-                    for k, v in inputs.items():
-                        if not isinstance(v, str):
-                            continue
-                        k_low = str(k).lower()
-                        is_explicit_lora_key = bool(
-                            re.fullmatch(r"lora(_\d+)?_name", k_low)
-                            or k_low in {"lora_name", "lora_file", "lora_path", "lora"}
-                        )
-                        if is_explicit_lora_key:
-                            name = self._clean_lora_name(v)
-                            if name and not self._looks_like_non_lora_asset(name):
-                                loras.append(name)
-                    if "lora_name" in inputs:
-                        name = self._clean_lora_name(str(inputs.get("lora_name", "")))
-                        if name and not self._looks_like_non_lora_asset(name):
-                            loras.append(name)
-
-                if "Model" not in out:
-                    for key in ("ckpt_name", "unet_name", "model_name", "checkpoint_name", "checkpoint", "model"):
-                        value = self._normalize_model_value(str(inputs.get(key, "")).strip())
-                        if value:
-                            out["Model"] = value
-                            break
-
-            if clip_texts:
-                out.setdefault("Prompt", clip_texts[0])
-            if len(clip_texts) > 1:
-                out.setdefault("Negative prompt", clip_texts[1])
-            if loras:
-                out.setdefault("LoRAs", ", ".join(sorted(set(loras), key=str.lower)))
-            else:
-                # Fallback for custom loaders (e.g. rgthree power lora nodes).
-                lora_guess = self._extract_loras_from_json_obj(data)
-                if lora_guess:
-                    out.setdefault("LoRAs", ", ".join(sorted(lora_guess, key=str.lower)))
-
-            if "Model" not in out:
-                model_guess = self._guess_model_from_text(text)
-                if model_guess:
-                    out["Model"] = model_guess
-
-            return out
-        except Exception:
-            return out
+        return MetadataParser.parse_comfy_prompt_json(text)
 
     @staticmethod
     def _guess_model_from_text(text: str) -> str:
-        # Fallback for workflows that don't expose a direct "Model" field.
-        patterns = [
-            r"([A-Za-z0-9_./\\-]+\.(?:safetensors|ckpt|pth))",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return ""
+        return MetadataParser.guess_model_from_text(text)
 
     @staticmethod
     def _normalize_model_value(value: str) -> str:
-        value = (value or "").strip()
-        if not value:
-            return ""
-        # Comfy node-link placeholders like "['50', 0]" or "[50, 0]" are not model names.
-        if re.fullmatch(r"\[\s*'?\d+'?\s*,\s*\d+\s*\]", value):
-            return ""
-        if value.lower() in {"none", "null", "[]"}:
-            return ""
-        return value
+        return MetadataParser.normalize_model_value(value)
 
     @staticmethod
     def _clean_lora_name(value: str) -> str:
-        value = (value or "").strip().strip("\"'")
-        if not value:
-            return ""
-        if re.fullmatch(r"\[\s*'?\d+'?\s*,\s*\d+\s*\]", value):
-            return ""
-        value = value.replace("\\", "/")
-        if "/" in value:
-            value = value.split("/")[-1]
-        if ":" in value and not value.lower().endswith(":safetensors"):
-            # Handle entries like "name: hash" and keep left side.
-            left = value.split(":", 1)[0].strip()
-            if left:
-                value = left
-        if value.lower().endswith(".safetensors"):
-            value = value[:-12]
-        return value.strip()
+        return MetadataParser.clean_lora_name(value)
 
     def _extract_loras_from_text(self, text: str) -> set[str]:
-        found: set[str] = set()
-        if not text:
-            return found
-
-        maybe_json = text.lstrip()
-        if maybe_json.startswith("{") and maybe_json.endswith("}"):
-            try:
-                data = json.loads(maybe_json)
-                found.update(self._extract_loras_from_json_obj(data))
-            except Exception:
-                pass
-
-        for match in re.findall(r"<lora:([^:>]+)(?::[^>]+)?>", text, flags=re.IGNORECASE):
-            name = self._clean_lora_name(match)
-            if name:
-                found.add(name)
-
-        # JSON style: "lora_name": "xxx.safetensors", "lora_1_name": "..."
-        for match in re.findall(
-            r'(?i)"(?:lora(?:_[0-9]+)?_name|lora_name|lora_file|lora_path)"\s*:\s*"([^"]+)"',
-            text,
-        ):
-            name = self._clean_lora_name(match)
-            if name:
-                found.add(name)
-
-        # Non-JSON / flat metadata style.
-        for match in re.findall(
-            r"(?i)\b(?:lora(?:_[0-9]+)?_name|lora_name|lora_file|lora_path)\s*[:=]\s*([^\n\r,]+)",
-            text,
-        ):
-            name = self._clean_lora_name(match)
-            if name:
-                found.add(name)
-
-        # A1111 "Lora hashes: name: hash, name2: hash2"
-        for block in re.findall(r"(?i)Lora hashes\s*:\s*([^\n\r]+)", text):
-            for part in block.split(","):
-                candidate = part.split(":", 1)[0].strip()
-                name = self._clean_lora_name(candidate)
-                if name:
-                    found.add(name)
-
-        return found
+        return MetadataParser.extract_loras_from_text(text)
 
     def _extract_loras_from_json_obj(self, obj: object, in_lora_context: bool = False) -> set[str]:
-        found: set[str] = set()
-
-        if isinstance(obj, dict):
-            class_type = str(obj.get("class_type", "")).lower()
-            context_here = in_lora_context or ("lora" in class_type)
-
-            for key, value in obj.items():
-                key_low = str(key).lower()
-                key_is_lora = "lora" in key_low or key_low.startswith("add_lora")
-                child_context = context_here or key_is_lora
-
-                if isinstance(value, str):
-                    if self._looks_like_lora_value(value, key_low, child_context):
-                        cleaned = self._clean_lora_name(value)
-                        if cleaned:
-                            found.add(cleaned)
-                elif isinstance(value, (dict, list)):
-                    found.update(self._extract_loras_from_json_obj(value, child_context))
-
-        elif isinstance(obj, list):
-            for item in obj:
-                found.update(self._extract_loras_from_json_obj(item, in_lora_context))
-
-        return found
+        return MetadataParser.extract_loras_from_json_obj(obj, in_lora_context)
 
     @staticmethod
     def _looks_like_lora_value(value: str, key_low: str, in_lora_context: bool) -> bool:
-        v = (value or "").strip()
-        if not v:
-            return False
-        if re.fullmatch(r"\[\s*'?\d+'?\s*,\s*\d+\s*\]", v):
-            return False
-        if v.lower() in {"none", "null", "false", "true"}:
-            return False
-
-        lv = v.lower()
-        is_safetensors = lv.endswith(".safetensors")
-        key_model_like = any(
-            x in key_low
-            for x in (
-                "model",
-                "ckpt",
-                "checkpoint",
-                "unet",
-                "base_model",
-                "diffusion_model",
-                "vae",
-                "clip",
-                "text_encoder",
-                "textencoder",
-                "tokenizer",
-                "encoder",
-            )
-        )
-        key_has_lora = "lora" in key_low
-        non_lora_name = ImageMetadataViewer._looks_like_non_lora_asset(v)
-
-        # Strong signal: explicit LoRA key or node context.
-        if key_has_lora and (is_safetensors or "." not in lv):
-            return True
-
-        # Generic fallback for keys that often hold named LoRA slots.
-        if is_safetensors and any(x in key_low for x in ("name", "file", "path")) and not key_model_like and not non_lora_name:
-            return True
-
-        return False
+        return MetadataParser.looks_like_lora_value(value, key_low, in_lora_context)
 
     @staticmethod
     def _looks_like_non_lora_asset(value: str) -> bool:
-        v = (value or "").strip().lower().replace("\\", "/")
-        if not v:
-            return False
-        if v.endswith(".safetensors"):
-            v = v[:-12]
-        name = v.split("/")[-1]
-        bad_tokens = (
-            "vae",
-            "text_encoder",
-            "text-encoder",
-            "clip",
-            "tokenizer",
-            "unet",
-            "checkpoint",
-            "ckpt",
-            "diffusion_model",
-            "image_vae",
-            "textencoder",
-        )
-        return any(token in name for token in bad_tokens)
+        return MetadataParser.looks_like_non_lora_asset(value)
 
     def _extract_non_lora_assets_from_text(self, text: str) -> set[str]:
-        found: set[str] = set()
-        if not text:
-            return found
-
-        maybe_json = text.lstrip()
-        if maybe_json.startswith("{") and maybe_json.endswith("}"):
-            try:
-                data = json.loads(maybe_json)
-                found.update(self._extract_non_lora_assets_from_json_obj(data))
-            except Exception:
-                pass
-
-        non_lora_keys = {
-            "ckpt_name",
-            "checkpoint_name",
-            "checkpoint",
-            "model_name",
-            "model",
-            "unet_name",
-            "vae_name",
-            "vae",
-            "text_encoder",
-            "clip_name",
-            "clip",
-        }
-        patterns = [
-            r'(?i)"(ckpt_name|checkpoint_name|checkpoint|model_name|model|unet_name|vae_name|text_encoder|clip_name|clip|vae)"\s*:\s*"([^"]+)"',
-            r"(?i)\b(ckpt_name|checkpoint_name|checkpoint|model_name|model|unet_name|vae_name|text_encoder|clip_name|clip|vae)\s*[:=]\s*([^\n\r,]+)",
-        ]
-        for pattern in patterns:
-            for key, value in re.findall(pattern, text):
-                key_low = str(key).strip().lower()
-                cleaned = self._clean_lora_name(value)
-                if not cleaned:
-                    continue
-                # Strong exclude by key semantics.
-                if key_low in non_lora_keys and "lora" not in key_low:
-                    found.add(cleaned)
-                    continue
-                if self._looks_like_non_lora_asset(cleaned):
-                    found.add(cleaned)
-                elif any(token in cleaned.lower() for token in ("qwen", "vae", "text_encoder", "clip", "unet")):
-                    found.add(cleaned)
-        return found
+        return MetadataParser.extract_non_lora_assets_from_text(text)
 
     def _extract_non_lora_assets_from_json_obj(self, obj: object) -> set[str]:
-        found: set[str] = set()
-        model_keys = {
-            "ckpt_name",
-            "checkpoint_name",
-            "checkpoint",
-            "model_name",
-            "model",
-            "unet_name",
-            "vae_name",
-            "vae",
-            "text_encoder",
-            "clip_name",
-            "clip",
-            "base_model",
-            "diffusion_model",
-        }
-
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                key_low = str(key).lower()
-                if isinstance(value, str):
-                    cleaned = self._clean_lora_name(value)
-                    if not cleaned:
-                        continue
-                    if key_low in model_keys and "lora" not in key_low:
-                        found.add(cleaned)
-                    elif self._looks_like_non_lora_asset(cleaned):
-                        found.add(cleaned)
-                elif isinstance(value, (dict, list)):
-                    found.update(self._extract_non_lora_assets_from_json_obj(value))
-        elif isinstance(obj, list):
-            for item in obj:
-                found.update(self._extract_non_lora_assets_from_json_obj(item))
-
-        return found
+        return MetadataParser.extract_non_lora_assets_from_json_obj(obj)
 
     def _parse_sd_parameters(self, text: str) -> tuple[str, str, dict[str, str]]:
-        prompt = ""
-        negative = ""
-        tail_data: dict[str, str] = {}
-
-        if "Negative prompt:" in text:
-            prompt_part, rest = text.split("Negative prompt:", 1)
-            prompt = prompt_part.strip()
-            if "Steps:" in rest:
-                neg_part, tail = rest.split("Steps:", 1)
-                negative = neg_part.strip()
-                tail_data.update(self._parse_kv_tail("Steps:" + tail))
-            else:
-                negative = rest.strip()
-        elif "Steps:" in text:
-            prompt_part, tail = text.split("Steps:", 1)
-            prompt = prompt_part.strip()
-            tail_data.update(self._parse_kv_tail("Steps:" + tail))
-        else:
-            prompt = text.strip()
-
-        return prompt, negative, tail_data
+        return MetadataParser.parse_sd_parameters(text)
 
     def _parse_kv_tail(self, tail: str) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for part in tail.split(","):
-            if ":" not in part:
-                continue
-            key, value = part.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if key and value:
-                out[key] = value
-
-        if "CFG scale" in out and "CFG" not in out:
-            out["CFG"] = out["CFG scale"]
-        if "Size" in out and "Resolution" not in out:
-            out["Resolution"] = out["Size"]
-
-        return out
+        return MetadataParser.parse_kv_tail(tail)
 
     def _build_details_view(self, path: Path, metadata: dict[str, str]) -> str:
         state = self._get_image_state(path)
@@ -3836,229 +2749,34 @@ class ImageMetadataViewer(tk.Tk):
         )
 
     def _pick(self, data: dict[str, str], keys: list[str]) -> str:
-        for key in keys:
-            value = str(data.get(key, "")).strip()
-            if value:
-                return value
-        return ""
+        return MetadataParser.pick(data, keys)
 
     def _extract_loras(self, prompt: str, metadata: dict[str, str]) -> str:
-        loras: set[str] = set()
-        excluded: set[str] = set()
-        loras.update(self._extract_loras_from_text(prompt))
-        excluded.update(self._extract_non_lora_assets_from_text(prompt))
-
-        # Structured LoRA extraction from Comfy workflow blocks.
-        for key in ("prompt", "workflow", "extra_pnginfo"):
-            value = str(metadata.get(key, "")).strip()
-            if value:
-                loras.update(self._extract_loras_from_workflow_json(value))
-                excluded.update(self._extract_model_assets_from_workflow_json(value))
-                excluded.update(self._extract_non_lora_assets_from_text(value))
-
-        # Textual fallback for explicit LoRA fields only.
-        for key in ("LoRAs", "loras", "lora", "Lora hashes", "parameters", "Comment", "comment", "UserComment"):
-            value = str(metadata.get(key, "")).strip()
-            if value:
-                loras.update(self._extract_loras_from_text(value))
-                excluded.update(self._extract_non_lora_assets_from_text(value))
-
-        # Remove accidental model name from LoRA list when both are similar.
-        model_name = self._clean_lora_name(self._pick(metadata, ["Model"]))
-        if model_name and model_name in loras:
-            loras.discard(model_name)
-        if model_name:
-            excluded.add(model_name)
-
-        if excluded:
-            canonical_excluded = {self._canonical_asset_name(item) for item in excluded if item}
-            loras = {item for item in loras if self._canonical_asset_name(item) not in canonical_excluded}
-        loras = {item for item in loras if not self._looks_like_non_lora_asset(item)}
-
-        return ", ".join(sorted(loras, key=str.lower)) if loras else "None"
+        return MetadataParser.extract_loras(prompt, metadata)
 
     @staticmethod
     def _canonical_asset_name(value: str) -> str:
-        cleaned = ImageMetadataViewer._clean_lora_name(value).lower()
-        if not cleaned:
-            return ""
-        return re.sub(r"[^a-z0-9]+", "", cleaned)
+        return MetadataParser.canonical_asset_name(value)
 
     @staticmethod
     def _is_modelish_node_type(node_type: str) -> bool:
-        low = (node_type or "").strip().lower()
-        if not low or "lora" in low:
-            return False
-        model_tokens = (
-            "loader",
-            "checkpoint",
-            "ckpt",
-            "unet",
-            "vae",
-            "clip",
-            "textencoder",
-            "text_encoder",
-            "diffusion",
-            "model",
-        )
-        return any(token in low for token in model_tokens)
+        return MetadataParser.is_modelish_node_type(node_type)
 
     @staticmethod
     def _iter_strings(value: object) -> list[str]:
-        out: list[str] = []
-        if isinstance(value, str):
-            out.append(value)
-        elif isinstance(value, dict):
-            for v in value.values():
-                out.extend(ImageMetadataViewer._iter_strings(v))
-        elif isinstance(value, list):
-            for item in value:
-                out.extend(ImageMetadataViewer._iter_strings(item))
-        return out
+        return MetadataParser.iter_strings(value)
 
     def _extract_model_assets_from_workflow_json(self, text: str) -> set[str]:
-        found: set[str] = set()
-        if not text:
-            return found
-
-        maybe_json = text.lstrip()
-        if not (maybe_json.startswith("{") and maybe_json.endswith("}")):
-            return found
-        try:
-            data = json.loads(maybe_json)
-        except Exception:
-            return found
-
-        def add_candidate(raw_value: str) -> None:
-            cleaned = self._clean_lora_name(raw_value)
-            if cleaned:
-                found.add(cleaned)
-
-        # Comfy workflow format: {"nodes":[...]}
-        if isinstance(data, dict) and isinstance(data.get("nodes"), list):
-            for node in data["nodes"]:
-                if not isinstance(node, dict):
-                    continue
-                node_type = str(node.get("type", ""))
-                if not self._is_modelish_node_type(node_type):
-                    continue
-
-                widgets = node.get("widgets_values")
-                if isinstance(widgets, list):
-                    for value in self._iter_strings(widgets):
-                        low = value.lower()
-                        if any(ext in low for ext in (".safetensors", ".ckpt", ".pth", ".pt")):
-                            add_candidate(value)
-
-                props = node.get("properties")
-                if isinstance(props, dict):
-                    models = props.get("models")
-                    if isinstance(models, list):
-                        for item in models:
-                            if not isinstance(item, dict):
-                                continue
-                            for key in ("name", "path", "model", "checkpoint", "ckpt_name", "model_name"):
-                                value = item.get(key)
-                                if isinstance(value, str):
-                                    add_candidate(value)
-
-        # Comfy prompt format: {"1":{"class_type":"...","inputs":{...}}, ...}
-        prompt_obj: object = data
-        if isinstance(data, dict) and isinstance(data.get("prompt"), dict):
-            prompt_obj = data["prompt"]
-        if isinstance(prompt_obj, dict):
-            for node in prompt_obj.values():
-                if not isinstance(node, dict):
-                    continue
-                class_type = str(node.get("class_type", ""))
-                if not self._is_modelish_node_type(class_type):
-                    continue
-                inputs = node.get("inputs")
-                if not isinstance(inputs, dict):
-                    continue
-                for key in (
-                    "ckpt_name",
-                    "checkpoint_name",
-                    "checkpoint",
-                    "model_name",
-                    "model",
-                    "unet_name",
-                    "vae_name",
-                    "vae",
-                    "clip_name",
-                    "clip",
-                    "text_encoder",
-                    "text_encoder_name",
-                ):
-                    value = inputs.get(key)
-                    if isinstance(value, str):
-                        add_candidate(value)
-
-        return found
+        return MetadataParser.extract_model_assets_from_workflow_json(text)
 
     def _extract_loras_from_workflow_json(self, text: str) -> set[str]:
-        found: set[str] = set()
-        if not text:
-            return found
-        maybe_json = text.lstrip()
-        if not (maybe_json.startswith("{") and maybe_json.endswith("}")):
-            return found
-        try:
-            data = json.loads(maybe_json)
-        except Exception:
-            return found
-
-        # Comfy workflow format: {"nodes":[...]}
-        if isinstance(data, dict) and isinstance(data.get("nodes"), list):
-            for node in data["nodes"]:
-                if not isinstance(node, dict):
-                    continue
-                node_type = str(node.get("type", "")).lower()
-                if "lora" not in node_type:
-                    continue
-                found.update(self._extract_loras_from_lora_node(node))
-
-        # Comfy prompt format: {"1":{"class_type":"...","inputs":{...}}, ...}
-        prompt_obj: object = data
-        if isinstance(data, dict) and isinstance(data.get("prompt"), dict):
-            prompt_obj = data["prompt"]
-        if isinstance(prompt_obj, dict):
-            for node in prompt_obj.values():
-                if not isinstance(node, dict):
-                    continue
-                class_type = str(node.get("class_type", "")).lower()
-                if "lora" not in class_type:
-                    continue
-                inputs = node.get("inputs", {})
-                if isinstance(inputs, dict):
-                    found.update(self._extract_loras_from_lora_payload(inputs))
-
-        return found
+        return MetadataParser.extract_loras_from_workflow_json(text)
 
     def _extract_loras_from_lora_node(self, node: dict[str, object]) -> set[str]:
-        found: set[str] = set()
-        widgets = node.get("widgets_values")
-        if isinstance(widgets, list):
-            for item in widgets:
-                found.update(self._extract_loras_from_lora_payload(item))
-        return found
+        return MetadataParser.extract_loras_from_lora_node(node)
 
     def _extract_loras_from_lora_payload(self, payload: object) -> set[str]:
-        found: set[str] = set()
-        if isinstance(payload, dict):
-            for key, value in payload.items():
-                key_low = str(key).lower()
-                if isinstance(value, str):
-                    if re.fullmatch(r"lora(_\d+)?", key_low) or re.fullmatch(r"lora(_\d+)?_name", key_low) or key_low in {"lora_name", "lora_file", "lora_path", "lora_model_name"}:
-                        name = self._clean_lora_name(value)
-                        if name and not self._looks_like_non_lora_asset(name):
-                            found.add(name)
-                elif isinstance(value, (dict, list)):
-                    found.update(self._extract_loras_from_lora_payload(value))
-        elif isinstance(payload, list):
-            for item in payload:
-                found.update(self._extract_loras_from_lora_payload(item))
-        return found
+        return MetadataParser.extract_loras_from_lora_payload(payload)
 
     def _safe_columns(self) -> int:
         value = self.columns_var.get().strip()
@@ -4068,10 +2786,7 @@ class ImageMetadataViewer(tk.Tk):
 
     @staticmethod
     def _safe_mtime(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except Exception:
-            return 0.0
+        return CatalogHelper.safe_mtime(path)
 
     def _sort_mtime_cached(self, path: Path) -> float:
         key = str(path)
@@ -4084,11 +2799,7 @@ class ImageMetadataViewer(tk.Tk):
 
     @staticmethod
     def _file_signature(path: Path) -> tuple[int, int]:
-        try:
-            stat = path.stat()
-            return int(stat.st_mtime_ns), int(stat.st_size)
-        except Exception:
-            return -1, -1
+        return CatalogHelper.file_signature(path)
 
     def _configure_metadata_tags(self) -> None:
         self.meta_text.tag_configure("file_title", font=("Segoe UI Semibold", 14), foreground=self._metadata_tag_targets["file_title"])
@@ -4251,6 +2962,7 @@ class ImageMetadataViewer(tk.Tk):
             except Exception:
                 pass
         self._summary_flash_after_ids.clear()
+        self._shutdown_ui_dispatcher()
         if self._folder_tip_win is not None and self._folder_tip_win.winfo_exists():
             self._folder_tip_win.destroy()
             self._folder_tip_win = None
