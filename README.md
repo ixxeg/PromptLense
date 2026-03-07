@@ -2,7 +2,8 @@
 
 Local Windows desktop app (Tkinter) for browsing generated images, reviewing generations, and reading embedded metadata.
 
-<img width="3839" height="2044" alt="image" src="https://github.com/user-attachments/assets/1d786320-9745-4ec4-9572-446558b30597" />
+<img width="3838" height="2051" alt="image" src="https://github.com/user-attachments/assets/d67c5abe-e1f1-4b61-96d0-b03c39b5ad6c" />
+
 
 PromptLens is built for image-generation workflows where files already contain useful metadata. It scans one or more folders, builds a fast thumbnail catalog, shows generation details in a structured inspector, and adds a lightweight review pass for favorites, rejects, and custom tags.
 
